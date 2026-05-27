@@ -1143,6 +1143,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.print_skip_softmax_stat = os.environ.get(
             "TRTLLM_PRINT_SKIP_SOFTMAX_STAT", "0") == "1"
 
+        # Layer-level fp8 KV cache scales. Initialized to 1.0 (no-op
+        # scaling) and mutated in-place by the model loader for fp8 KV
+        # cache. Used as the default when ``forward_args.kv_scale_*`` is
+        # ``None`` (e.g. non-fp4-KV-cache paths).
+        self.kv_cache_scaling_factor = torch.ones(1,
+                                                  dtype=torch.float32,
+                                                  device='cuda')
+        self.kv_scale_quant_orig = self.kv_cache_scaling_factor
+        self.kv_scale_orig_quant = 1.0 / self.kv_cache_scaling_factor
+
         self.local_layer_idx: Optional[int] = None
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
@@ -1439,6 +1449,17 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         if forward_args.attention_window_size is None:
             forward_args.attention_window_size = metadata.max_seq_len
+
+        # Fall back to the layer-level kv_cache_scaling_factor when the caller
+        # didn't supply per-call scales. Required for fp8 KV cache models whose
+        # production caller (modules/attention.py) only populates these for
+        # fp4 KV cache. Without this fallback NVFP4 + fp8 KV cache models pass
+        # ``None`` to thop.attention and the kernel silently defaults to 1.0,
+        # collapsing accuracy.
+        if forward_args.kv_scale_orig_quant is None:
+            forward_args.kv_scale_orig_quant = self.kv_scale_orig_quant
+        if forward_args.kv_scale_quant_orig is None:
+            forward_args.kv_scale_quant_orig = self.kv_scale_quant_orig
 
         helix_active = metadata.helix_position_offsets is not None
         use_sage_attn = (forward_args.sage_attn_num_elts_per_blk_q > 0
