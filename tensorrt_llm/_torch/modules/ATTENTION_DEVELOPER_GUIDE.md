@@ -299,16 +299,18 @@ The main differences across backends:
 
 `TrtllmAttention` dispatches attention through an ordered list of internal FMHA
 libraries. `CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
-`FlashInferSparseMlaFmha` integrates SM120/SM121 sparse MLA kernels for
+`MsaSparseGqaFmha` provides the specialized MiniMax-M3 sparse path,
+`PrimsTSFmha` integrates the vendored task-scheduled Blackwell paged context,
+decode, and MLA-decode kernels, `FlashInferSparseMlaFmha` integrates SM120/SM121 sparse MLA kernels for
 DeepSeek-V4 and DSA,
 `FlashInferTrtllmGenFmha` integrates trtllm-gen kernels from FlashInfer into
 the `TRTLLM` backend, and `FallbackFmha` calls the regular `thop.attention`
 runtime path. These are not separate attention backends.
 
 `TLLM_FMHA_LIBS` controls the ordered list. Unset means
-`cute_dsl_mla,msa_sparse_gqa,flashinfer_sparse_mla,flashinfer_trtllm_gen,fallback`;
+`cute_dsl_mla,msa_sparse_gqa,prims_ts,flashinfer_sparse_mla,flashinfer_trtllm_gen,fallback`;
 use `TLLM_FMHA_LIBS=fallback` or
-`TLLM_FMHA_LIBS=-cute_dsl_mla,-msa_sparse_gqa,-flashinfer_sparse_mla,-flashinfer_trtllm_gen`
+`TLLM_FMHA_LIBS=-cute_dsl_mla,-msa_sparse_gqa,-prims_ts,-flashinfer_sparse_mla,-flashinfer_trtllm_gen`
 to force the fallback
 path. Each FMHA library exposes `is_available()` for module/static environment
 checks and `is_supported()` for per-forward request checks.
@@ -352,6 +354,12 @@ The FMHA package is split by role:
 - `fmha/combined.py` composes different context and generation implementations
   for non-MLA mixed batches.
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
+- `fmha/prims_ts.py` adapts TRT-LLM QKV preprocessing and paged-cache metadata
+  to the vendored PrimTS kernels. PrimTS is imported lazily and requires
+  CUTLASS DSL 4.7 or newer on SM100/SM103. The initial adapter admits
+  unquantized FP16/BF16 HND paged full attention and BF16 MLA generation;
+  cyclic/sliding-window caches, speculative decoding, and MLA context fall
+  through to the next library.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
