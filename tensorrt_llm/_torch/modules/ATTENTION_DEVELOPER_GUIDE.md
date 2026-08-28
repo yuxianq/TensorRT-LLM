@@ -308,12 +308,15 @@ the `TRTLLM` backend, and `FallbackFmha` calls the regular `thop.attention`
 runtime path. These are not separate attention backends.
 
 `TLLM_FMHA_LIBS` controls the ordered list. Unset means
-`cute_dsl_mla,msa_sparse_gqa,prims_ts,flashinfer_sparse_mla,flashinfer_trtllm_gen,fallback`;
-use `TLLM_FMHA_LIBS=fallback` or
-`TLLM_FMHA_LIBS=-cute_dsl_mla,-msa_sparse_gqa,-prims_ts,-flashinfer_sparse_mla,-flashinfer_trtllm_gen`
-to force the fallback
-path. Each FMHA library exposes `is_available()` for module/static environment
-checks and `is_supported()` for per-forward request checks.
+`cute_dsl_mla,msa_sparse_gqa,flashinfer_sparse_mla,flashinfer_trtllm_gen,fallback`;
+PrimTS is opt-in because it may add host overhead. Use
+`TLLM_FMHA_LIBS=+prims_ts` to add it to the defaults or
+`TLLM_FMHA_LIBS=fallback` to force the fallback path. Delta entries update
+membership and then use the canonical registry order, while an exact list
+preserves the user-specified order. PrimTS is first in the canonical order, so
+every request admitted by its request-level support check dispatches to it when
+enabled. Each FMHA library exposes `is_available()` for module/static
+environment checks and `is_supported()` for per-forward request checks.
 For mixed non-MLA batches, the dispatcher checks each active phase independently
 with `is_supported(..., phase=...)`; a phased library accepts only phases backed
 by its corresponding `run_*()` entry point.

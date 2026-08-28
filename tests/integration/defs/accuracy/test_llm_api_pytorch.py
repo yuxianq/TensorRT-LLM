@@ -1764,7 +1764,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
         calls = _count_prims_ts_phase_calls(mocker)
         env = {
-            "TLLM_FMHA_LIBS": "prims_ts,fallback",
+            "TLLM_FMHA_LIBS": "+prims_ts",
             "TLLM_WORKER_USE_SINGLE_PROCESS": "1",
         }
         kv_cache_config = KvCacheConfig(
@@ -5045,7 +5045,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
         calls = _count_prims_ts_phase_calls(mocker)
         env = {
-            "TLLM_FMHA_LIBS": "prims_ts,fallback",
+            "TLLM_FMHA_LIBS": "+prims_ts",
             "TLLM_WORKER_USE_SINGLE_PROCESS": "1",
         }
         kv_cache_config = KvCacheConfig(
