@@ -13,8 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
+import inspect
 import math
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -93,6 +96,18 @@ class _Attention:
         )
         self.rotary_inv_freq = None
         self.rotary_cos_sin = None
+
+
+def _function_source(path: Path, function_name: str) -> str:
+    source = path.read_text()
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name
+    )
+    assert function.end_lineno is not None
+    return "".join(source.splitlines(keepends=True)[function.lineno - 1 : function.end_lineno])
 
 
 def _support_result(
@@ -676,6 +691,7 @@ def test_context_metadata_stages_live_lengths_and_padded_pages() -> None:
         batch_size=2,
         page_size=32,
         max_kv_len=64,
+        window_left=-1,
     )
 
     assert logical_kv_indptr.data_ptr() == cu_kv_seqlens.data_ptr()
@@ -695,46 +711,122 @@ def test_context_metadata_stages_live_lengths_and_padded_pages() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    ("max_kv_len", "expected_pages"),
-    [
-        (96, [10, 11, 12, 12]),
-        (128, [10, 11, 12, 13]),
-    ],
-    ids=["tail-page", "full-tile"],
-)
-def test_context_metadata_b1_stages_one_compact_tile(
-    max_kv_len: int,
-    expected_pages: list[int],
-) -> None:
-    block_tables = torch.tensor(
-        [[[10, 11, 12, 13, 14, 15, 16, 17], [110, 111, 112, 113, 114, 115, 116, 117]]],
-        dtype=torch.int32,
-    )
+def _stage_b1_context_metadata(
+    block_tables: torch.Tensor,
+    *,
+    head_dim: int = 128,
+    max_kv_len: int = 128,
+    window_left: int = -1,
+) -> tuple[PrimsTSFmha, torch.Tensor]:
     cu_kv_seqlens = torch.tensor([0, max_kv_len], dtype=torch.int32)
     sequence_lengths = torch.tensor([max_kv_len], dtype=torch.int32)
-    fmha = PrimsTSFmha(_Attention())
+    attn = _Attention(head_dim=head_dim)
+    fmha = PrimsTSFmha(attn)
     fmha._ensure_metadata_buffers(
         torch.device("cpu"),
         1,
-        8,
+        block_tables.shape[-1],
         32,
         need_context=True,
     )
 
-    _, seq_lens, dense_page_table = fmha._stage_context_metadata(
+    _, _, dense_page_table = fmha._stage_context_metadata(
         block_tables,
         cu_kv_seqlens,
         sequence_lengths,
         batch_size=1,
         page_size=32,
         max_kv_len=max_kv_len,
+        window_left=window_left,
     )
+    return fmha, dense_page_table
 
-    assert seq_lens.data_ptr() == sequence_lengths.data_ptr()
+
+def test_context_metadata_b1_d128_full_tile_aliases_native_k_row() -> None:
+    block_tables = torch.tensor(
+        [[[10, 11, 12, 13, 14, 15, 16, 17], [110, 111, 112, 113, 114, 115, 116, 117]]],
+        dtype=torch.int32,
+    )
+    source_k_row = block_tables[0, 0, :4]
+    assert source_k_row.data_ptr() % 16 == 0
+
+    fmha, dense_page_table = _stage_b1_context_metadata(block_tables)
+
     assert dense_page_table.shape == (1, 2, 4)
     assert dense_page_table.is_contiguous()
-    expected = torch.tensor([[expected_pages, expected_pages]], dtype=torch.int32)
+    assert dense_page_table.data_ptr() == source_k_row.data_ptr()
+    assert dense_page_table.data_ptr() != fmha._context_page_indices_buffer.data_ptr()
+    torch.testing.assert_close(dense_page_table[0, 0], source_k_row)
+    source_k_row.add_(10)
+    torch.testing.assert_close(
+        dense_page_table[0, 0],
+        torch.tensor([20, 21, 22, 23], dtype=torch.int32),
+    )
+
+
+def test_context_metadata_b1_tail_falls_back_to_staged_copy() -> None:
+    block_tables = torch.tensor(
+        [[[10, 11, 12, 13], [110, 111, 112, 113]]],
+        dtype=torch.int32,
+    )
+
+    _, dense_page_table = _stage_b1_context_metadata(block_tables, max_kv_len=96)
+
+    assert dense_page_table.data_ptr() != block_tables[0, 0].data_ptr()
+    expected = torch.tensor([[[10, 11, 12, 12], [10, 11, 12, 12]]], dtype=torch.int32)
+    torch.testing.assert_close(dense_page_table, expected)
+
+
+def test_context_metadata_b1_d256_falls_back_to_staged_copy() -> None:
+    block_tables = torch.tensor(
+        [[[10, 11, 12, 13], [110, 111, 112, 113]]],
+        dtype=torch.int32,
+    )
+
+    _, dense_page_table = _stage_b1_context_metadata(block_tables, head_dim=256)
+
+    assert dense_page_table.data_ptr() != block_tables[0, 0].data_ptr()
+    expected = torch.tensor([[[10, 11, 12, 13], [10, 11, 12, 13]]], dtype=torch.int32)
+    torch.testing.assert_close(dense_page_table, expected)
+
+
+def test_context_metadata_b1_window_falls_back_to_staged_copy() -> None:
+    block_tables = torch.tensor(
+        [[[10, 11, 12, 13], [110, 111, 112, 113]]],
+        dtype=torch.int32,
+    )
+
+    _, dense_page_table = _stage_b1_context_metadata(block_tables, window_left=64)
+
+    assert dense_page_table.data_ptr() != block_tables[0, 0].data_ptr()
+    expected = torch.tensor([[[10, 11, 12, 13], [10, 11, 12, 13]]], dtype=torch.int32)
+    torch.testing.assert_close(dense_page_table, expected)
+
+
+def test_context_metadata_b1_noncompact_source_falls_back_to_staged_copy() -> None:
+    storage = torch.tensor(
+        [10, 0, 11, 0, 12, 0, 13, 0, 110, 0, 111, 0, 112, 0, 113],
+        dtype=torch.int32,
+    )
+    block_tables = storage.as_strided((1, 2, 4), (15, 8, 2))
+    assert not block_tables[0, 0].is_contiguous()
+
+    _, dense_page_table = _stage_b1_context_metadata(block_tables)
+
+    assert dense_page_table.data_ptr() != block_tables[0, 0].data_ptr()
+    expected = torch.tensor([[[10, 11, 12, 13], [10, 11, 12, 13]]], dtype=torch.int32)
+    torch.testing.assert_close(dense_page_table, expected)
+
+
+def test_context_metadata_b1_short_source_storage_falls_back_to_staged_copy() -> None:
+    storage = torch.tensor([10, 11, 12, 13], dtype=torch.int32)
+    block_tables = storage.as_strided((1, 2, 4), (0, 0, 1))
+    assert block_tables[0, 0].is_contiguous()
+
+    _, dense_page_table = _stage_b1_context_metadata(block_tables)
+
+    assert dense_page_table.data_ptr() != block_tables[0, 0].data_ptr()
+    expected = torch.tensor([[[10, 11, 12, 13], [10, 11, 12, 13]]], dtype=torch.int32)
     torch.testing.assert_close(dense_page_table, expected)
 
 
@@ -875,6 +967,67 @@ def test_mla_aligned_sequence_lengths_use_source_storage() -> None:
     assert actual.data_ptr() == sequence_lengths.data_ptr()
 
 
+def test_context_live_unchecked_forwards_exact_compiled_abi() -> None:
+    from tensorrt_llm._torch.attention_backend.prims_ts.context import BatchPrefillPagedTSWrapper
+
+    wrapper = object.__new__(BatchPrefillPagedTSWrapper)
+    wrapper._planned = True
+    wrapper._live_metadata = True
+    wrapper._scale_softmax_log2 = object()
+    wrapper._output_scale = object()
+    wrapper._compiled = Mock()
+    q, k_cache, v_cache, out = (object() for _ in range(4))
+    qo_indptr, logical_kv_indptr, dense_page_idx_kv, seq_lens_kv = (object() for _ in range(4))
+
+    actual = wrapper._run_live_unchecked(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        qo_indptr,
+        logical_kv_indptr,
+        dense_page_idx_kv,
+        seq_lens_kv,
+    )
+
+    assert actual is out
+    wrapper._compiled.assert_called_once_with(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        wrapper._scale_softmax_log2,
+        wrapper._output_scale,
+        qo_indptr,
+        logical_kv_indptr,
+        dense_page_idx_kv,
+        seq_lens_kv,
+    )
+
+
+@pytest.mark.parametrize(
+    ("planned", "live_metadata", "expected_error"),
+    [
+        (False, False, "plan_live\\(\\) must be called"),
+        (True, False, "requires a plan_live\\(\\) plan"),
+    ],
+    ids=["unplanned", "snapshot-plan"],
+)
+def test_context_live_unchecked_requires_live_plan(
+    planned: bool,
+    live_metadata: bool,
+    expected_error: str,
+) -> None:
+    from tensorrt_llm._torch.attention_backend.prims_ts.context import BatchPrefillPagedTSWrapper
+
+    wrapper = object.__new__(BatchPrefillPagedTSWrapper)
+    wrapper._planned = planned
+    wrapper._live_metadata = live_metadata
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        wrapper._run_live_unchecked(*(object() for _ in range(8)))
+
+
 def test_context_wrapper_plans_once_and_reads_live_staged_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1012,28 +1165,22 @@ def test_context_wrapper_plans_once_and_reads_live_staged_metadata(
         "output_scale": 1.0,
         "out_dtype": torch.bfloat16,
     }
-    wrapper.run.assert_called_once()
-    run_args = wrapper.run.call_args.args
-    run_kwargs = wrapper.run.call_args.kwargs
-    first_metadata_ptrs = tuple(
-        run_kwargs[name].data_ptr()
-        for name in (
-            "qo_indptr",
-            "logical_kv_indptr",
-            "seq_lens_kv",
-            "dense_page_idx_kv",
-        )
+    wrapper._run_live_unchecked.assert_called_once()
+    run_args = wrapper._run_live_unchecked.call_args.args
+    assert len(run_args) == 8
+    first_metadata_ptrs = tuple(run_args[index].data_ptr() for index in (4, 5, 7, 6))
+    assert all(
+        run_arg is plan_arg for run_arg, plan_arg in zip(run_args[:3], plan_args, strict=True)
     )
-    assert all(run_arg is plan_arg for run_arg, plan_arg in zip(run_args, plan_args, strict=True))
-    assert run_kwargs["out"] is output
-    assert run_kwargs["qo_indptr"] is cu_q_seqlens
-    assert run_kwargs["logical_kv_indptr"].data_ptr() == cu_kv_seqlens.data_ptr()
+    assert run_args[3] is output
+    assert run_args[4] is cu_q_seqlens
+    assert run_args[5].data_ptr() == cu_kv_seqlens.data_ptr()
     torch.testing.assert_close(
-        run_kwargs["seq_lens_kv"],
+        run_args[7],
         torch.tensor([33, 64], dtype=torch.int32),
     )
     torch.testing.assert_close(
-        run_kwargs["dense_page_idx_kv"],
+        run_args[6],
         torch.tensor(
             [
                 [[0, 1, 1, 1], [0, 1, 1, 1]],
@@ -1053,26 +1200,16 @@ def test_context_wrapper_plans_once_and_reads_live_staged_metadata(
     wrapper_factory.assert_called_once_with()
     assert wrapper.reset_workspace_buffer.call_count == 2
     wrapper.plan_live.assert_called_once()
-    assert wrapper.run.call_count == 2
-    second_run_kwargs = wrapper.run.call_args.kwargs
-    assert (
-        tuple(
-            second_run_kwargs[name].data_ptr()
-            for name in (
-                "qo_indptr",
-                "logical_kv_indptr",
-                "seq_lens_kv",
-                "dense_page_idx_kv",
-            )
-        )
-        == first_metadata_ptrs
-    )
+    assert wrapper._run_live_unchecked.call_count == 2
+    wrapper.run.assert_not_called()
+    second_run_args = wrapper._run_live_unchecked.call_args.args
+    assert tuple(second_run_args[index].data_ptr() for index in (4, 5, 7, 6)) == first_metadata_ptrs
     torch.testing.assert_close(
-        second_run_kwargs["seq_lens_kv"],
+        second_run_args[7],
         torch.tensor([64, 33], dtype=torch.int32),
     )
     torch.testing.assert_close(
-        second_run_kwargs["dense_page_idx_kv"],
+        second_run_args[6],
         torch.tensor(
             [
                 [[1, 2, 2, 2], [1, 2, 2, 2]],
@@ -1215,7 +1352,9 @@ def test_generation_wrapper_plans_once_and_reads_live_native_csr(
         "window_left": 15,
         "max_kv_len": 96,
         "live_metadata": True,
+        "enable_pdl": fmha._enable_pdl,
     }
+    assert fmha._decode_wrappers[2] is wrapper
     wrapper.run.assert_called_once()
     run_args = wrapper.run.call_args.args
     run_kwargs = wrapper.run.call_args.kwargs
@@ -1265,6 +1404,169 @@ def test_generation_wrapper_plans_once_and_reads_live_native_csr(
             fmha_workspace[32:],
             torch.full((32,), 9, dtype=torch.uint8),
         )
+
+
+def test_decode_pdl_environment_is_snapshotted_and_threaded_to_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    get_env_enable_pdl = Mock(return_value=True)
+    monkeypatch.setattr(prims_ts_module, "get_env_enable_pdl", get_env_enable_pdl)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    wrapper = Mock()
+    monkeypatch.setattr(
+        prims_ts_module,
+        "_create_prims_decode_wrapper",
+        Mock(return_value=wrapper),
+    )
+    fmha = PrimsTSFmha(_Attention())
+    get_env_enable_pdl.return_value = False
+    paged_kv_indptr = torch.tensor([0, 2], dtype=torch.int32)
+    paged_kv_indices = torch.tensor([0, 1], dtype=torch.int32)
+    workspace = torch.empty(64, dtype=torch.uint8)
+
+    first = fmha._get_or_plan_decode_wrapper(
+        paged_kv_indptr,
+        paged_kv_indices,
+        workspace,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        page_size=32,
+        seq_len_q=1,
+        max_kv_len=64,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        mask_type="causal",
+        window_left=-1,
+    )
+    second = fmha._get_or_plan_decode_wrapper(
+        paged_kv_indptr,
+        paged_kv_indices,
+        workspace,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        page_size=32,
+        seq_len_q=1,
+        max_kv_len=64,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        mask_type="causal",
+        window_left=-1,
+    )
+
+    assert first is second is wrapper
+    get_env_enable_pdl.assert_called_once_with()
+    wrapper.plan.assert_called_once()
+    assert wrapper.plan.call_args.kwargs["enable_pdl"] is True
+    assert fmha._decode_wrappers[1] is wrapper
+
+
+@pytest.mark.parametrize(
+    "enable_pdl",
+    [0, 1.0, "true", torch.tensor(True)],
+    ids=["integer", "float", "string", "tensor"],
+)
+def test_decode_plan_requires_an_exact_bool_for_enable_pdl(enable_pdl: object) -> None:
+    from tensorrt_llm._torch.attention_backend.prims_ts.decode import BatchDecodePagedTSWrapper
+
+    wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
+
+    with pytest.raises(TypeError, match="enable_pdl must be a bool"):
+        wrapper.plan(
+            None,
+            None,
+            None,
+            8,
+            2,
+            128,
+            32,
+            enable_pdl=enable_pdl,
+        )
+
+
+def test_decode_pdl_is_a_distinct_compiler_cache_key() -> None:
+    from tensorrt_llm._torch.attention_backend.prims_ts import decode
+
+    parameters = tuple(inspect.signature(decode._get_compiled_decode).parameters.values())
+    assert parameters[-1].name == "enable_pdl"
+    assert parameters[-1].default is False
+
+    decode_path = Path(decode.__file__).resolve()
+    compiler_source = " ".join(_function_source(decode_path, "_get_compiled_decode").split())
+    wrapper_source = " ".join(_function_source(decode_path, "plan").split())
+    raw_source = " ".join(
+        _function_source(
+            decode_path,
+            "prims_ts_batch_decode_with_kv_cache",
+        ).split()
+    )
+    assert "dataclasses.replace(spec.config, use_external_pdl=enable_pdl)" in compiler_source
+    assert '("use_external_pdl", enable_pdl)' in compiler_source
+    assert (
+        "_get_compiled_decode( *semantic_key, kv_prefix_mode, kv_lengths_mode, enable_pdl )"
+        in wrapper_source
+    )
+    assert '_get_compiled_decode( *semantic_key, "dynamic", "dynamic", False )' in raw_source
+
+
+def test_decode_config_combines_external_and_reducer_pdl_without_mutation() -> None:
+    from tensorrt_llm._torch.attention_backend.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        FmhaDecodeConfig,
+    )
+
+    base = FmhaDecodeConfig()
+    external = replace(base, use_external_pdl=True)
+    reducer = replace(base, use_separate_reduction_kernel=True)
+
+    assert not base.use_external_pdl
+    assert not base.use_main_launch_pdl
+    assert external.use_external_pdl
+    assert external.use_main_launch_pdl
+    assert reducer.use_main_launch_pdl
+
+
+def test_decode_external_pdl_kernel_handoffs_precede_runtime_memory_reads() -> None:
+    source_dir = (
+        Path(prims_ts_module.__file__).resolve().parent.parent
+        / "prims_ts"
+        / "kernels"
+        / "fmha_decode"
+    )
+    main_source = _function_source(source_dir / "fmha_decode_kernel.py", "decode_gen_kernel")
+    main_launch_source = _function_source(
+        source_dir / "fmha_decode_kernel.py",
+        "fmha_decode_launch",
+    )
+    reducer_source = _function_source(
+        source_dir / "reduction.py",
+        "decode_gen_parallel_separate_reduction_kernel",
+    )
+
+    main_external = main_source.index("if cutlass.const_expr(cfg.use_external_pdl):")
+    main_wait = main_source.index("GridDepAction.WAIT", main_external)
+    main_launch = main_source.index("GridDepAction.LAUNCH_DEPENDENTS", main_wait)
+    main_q_bounds = main_source.index("_q_seq_bounds")
+    assert main_source.index("q_group_idx = q_group_cta_idx") < main_external
+    assert main_external < main_wait < main_launch < main_q_bounds
+    assert "not cfg.use_separate_reduction_kernel" in main_source[main_wait:main_launch]
+    assert "use_pdl=cfg.use_main_launch_pdl" in main_launch_source
+
+    reducer_wait = reducer_source.index("GridDepAction.WAIT")
+    reducer_external = reducer_source.index(
+        "if cutlass.const_expr(cfg.use_external_pdl):",
+        reducer_wait,
+    )
+    reducer_launch = reducer_source.index(
+        "GridDepAction.LAUNCH_DEPENDENTS",
+        reducer_external,
+    )
+    reducer_schedule = reducer_source.index(
+        "if cutlass.const_expr(cfg.use_compact_parallel_reduction):"
+    )
+    assert reducer_wait < reducer_external < reducer_launch < reducer_schedule
 
 
 def test_decode_layer_adapters_bind_the_same_shared_workspace(

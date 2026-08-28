@@ -15,6 +15,7 @@
 
 """Task-scheduled paged decode with a FlashInfer-style plan/run lifecycle."""
 
+import dataclasses
 from collections.abc import Callable
 from dataclasses import dataclass
 import functools
@@ -1282,9 +1283,12 @@ def _get_compiled_decode(
     window_left: int,
     kv_prefix_mode: Literal["dynamic", "planned_full"] = "dynamic",
     kv_lengths_mode: Literal["dynamic", "planned_uniform_max"] = "dynamic",
+    enable_pdl: bool = False,
 ):
     """Compile and cache one exact semantic TS decode plan."""
 
+    if type(enable_pdl) is not bool:
+        raise TypeError("enable_pdl must be a bool")
     if kv_prefix_mode not in ("dynamic", "planned_full"):
         raise ValueError(f"unsupported KV-prefix compile mode {kv_prefix_mode!r}")
     if kv_lengths_mode not in ("dynamic", "planned_uniform_max"):
@@ -1323,7 +1327,7 @@ def _get_compiled_decode(
         use_packed_q,
         window_left,
     )
-    cfg = spec.config
+    cfg = dataclasses.replace(spec.config, use_external_pdl=enable_pdl)
     max_active_clusters = spec.max_active_clusters
     partial_o_shape, partial_stats_shape, counter_shape = spec.scratch_shapes
     partial_dtype = output_dtype
@@ -1598,6 +1602,7 @@ def _get_compiled_decode(
     policy = spec.policy + (
         ("kv_prefix_mode", kv_prefix_mode),
         ("kv_lengths_mode", kv_lengths_mode),
+        ("use_external_pdl", enable_pdl),
     )
     return compiled_main, compiled_reducer, policy, spec.scratch_shapes
 
@@ -2103,7 +2108,7 @@ def prims_ts_batch_decode_with_kv_cache(
             workspace_buffer=workspace_buffer,
         )
     compiled_main, compiled_reducer, _, scratch_shapes = _get_compiled_decode(
-        *semantic_key, "dynamic", "dynamic"
+        *semantic_key, "dynamic", "dynamic", False
     )
     if scratch_shapes != spec.scratch_shapes:
         raise RuntimeError("FMHA workspace policy changed during compilation")
@@ -2177,6 +2182,7 @@ class BatchDecodePagedTSWrapper:
         window_left: int = -1,
         max_kv_len: Optional[int] = None,
         live_metadata: bool = False,
+        enable_pdl: bool = False,
         workspace_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         """Prepare native CSR metadata, policy, compiled callables, and scratch.
@@ -2229,6 +2235,13 @@ class BatchDecodePagedTSWrapper:
         Callers own all value contracts described by
         :func:`prims_ts_batch_decode_with_kv_cache`.
 
+        ``enable_pdl=True`` compiles the main launch into an external
+        programmatic-dependent-launch chain: it waits for the preceding grid
+        and publishes the following grid once it may launch. This option is a
+        compile-cache key. It is independent of the internal main-to-reducer
+        PDL ordering, which remains enabled whenever a standalone reducer is
+        selected.
+
         ``workspace_buffer`` overrides the constructor workspace for this plan,
         allowing one facade to replan after an eager/graph workspace switch.
         An external workspace is initialized only while a plan is bound;
@@ -2260,10 +2273,14 @@ class BatchDecodePagedTSWrapper:
             Static K/V length bound; defaults to the metadata maximum.
         live_metadata : bool
             Select synchronization-free live-metadata planning.
+        enable_pdl : bool
+            Enable external programmatic-dependent launch for the main kernel.
         workspace_buffer : torch.Tensor, optional
             Caller-owned scratch for this plan.
         """
 
+        if type(enable_pdl) is not bool:
+            raise TypeError("enable_pdl must be a bool")
         if not isinstance(live_metadata, bool):
             raise TypeError("live_metadata must be a bool")
         if live_metadata and paged_kv_last_page_len is not None:
@@ -2457,7 +2474,7 @@ class BatchDecodePagedTSWrapper:
                 )
             )
         compiled_main, compiled_reducer, policy, scratch_shapes = _get_compiled_decode(
-            *semantic_key, kv_prefix_mode, kv_lengths_mode
+            *semantic_key, kv_prefix_mode, kv_lengths_mode, enable_pdl
         )
         workspace_layout = _make_decode_workspace_layout(
             scratch_shapes,
