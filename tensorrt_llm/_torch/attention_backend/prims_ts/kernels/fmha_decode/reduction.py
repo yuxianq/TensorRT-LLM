@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -454,6 +455,11 @@ def decode_gen_parallel_separate_reduction_kernel(
     # partial GMEM. The wait is CTA-convergent and stays outside both schedules.
     if cutlass.const_expr(cfg.use_parallel_separate_reduction_pdl):
         prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+
+    if cutlass.const_expr(cfg.use_external_pdl):
+        pdl_thread_idx, _, _ = cute.arch.thread_idx()
+        if pdl_thread_idx == Int32(0):
+            prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
 
     if cutlass.const_expr(cfg.use_compact_parallel_reduction):
         _reduce_exact_splits_body(

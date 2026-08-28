@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -894,6 +895,8 @@ class FmhaDecodeConfig:
     softmax_order_barrier_threads: int = 256
     use_cluster_smem_reduction: bool = False
     use_separate_reduction_kernel: bool = False
+    # Wait for an external producer and publish this decode plan's dependent launch.
+    use_external_pdl: bool = False
     # Compile-time attention-mask selection. Public APIs normalize the string
     # names in MASK_TYPES to the integer constants used by CuTe DSL branches.
     mask_type: int = DENSE
@@ -915,6 +918,11 @@ class FmhaDecodeConfig:
     def use_parallel_separate_reduction_pdl(self) -> bool:
         """Order every production standalone reducer through PDL."""
         return self.use_separate_reduction_kernel
+
+    @property
+    def use_main_launch_pdl(self) -> bool:
+        """Launch the main kernel with PDL for either dependency chain."""
+        return self.use_external_pdl or self.use_parallel_separate_reduction_pdl
 
     @property
     def parallel_reduction_padded_splits(self) -> int:

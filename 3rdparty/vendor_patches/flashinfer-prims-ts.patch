@@ -56,7 +56,7 @@ index 0000000000000000000000000000000000000000..59238dbc477df3b8068a9e56559ad1c5
 +
 +    return decorator
 diff --git a/context.py b/context.py
-index 69b349129d59e3ef989cdf1b344501efd3642424..6e60c572b0b82ce7f33334d27ab473bf170d7d40 100644
+index 69b349129d59e3ef989cdf1b344501efd3642424..897b3c7586ac5e501f594b9c6f94d8a51c1cc392 100644
 --- a/context.py
 +++ b/context.py
 @@ -1,3 +1,4 @@
@@ -74,8 +74,54 @@ index 69b349129d59e3ef989cdf1b344501efd3642424..6e60c572b0b82ce7f33334d27ab473bf
  from ._tensor_aliasing import _validate_out_does_not_overlap_inputs
  
  
+@@ -2188,6 +2188,45 @@ class BatchPrefillPagedTSWrapper:
+         self._live_metadata = True
+         self._planned = True
+ 
++    def _run_live_unchecked(
++        self,
++        q: torch.Tensor,
++        k_cache: torch.Tensor,
++        v_cache: torch.Tensor,
++        out: torch.Tensor,
++        qo_indptr: torch.Tensor,
++        logical_kv_indptr: torch.Tensor,
++        dense_page_idx_kv: torch.Tensor,
++        seq_lens_kv: torch.Tensor,
++        /,
++    ) -> torch.Tensor:
++        """Launch a trusted live-metadata plan without runtime validation.
++
++        Unlike :meth:`run`, this private adapter entry point does not enforce
++        the public two-plane page-table contract.  A caller that binds the
++        query-paired D128 specialization may provide a storage-bounded second
++        plane because that kernel consumes plane zero for both separately
++        shifted K/V pools.  All other plans must still provide both logical
++        planes.
++        """
++        if not self._planned:
++            raise RuntimeError("plan_live() must be called before _run_live_unchecked()")
++        if not self._live_metadata:
++            raise RuntimeError("_run_live_unchecked() requires a plan_live() plan")
++        self._compiled(
++            q,
++            k_cache,
++            v_cache,
++            out,
++            self._scale_softmax_log2,
++            self._output_scale,
++            qo_indptr,
++            logical_kv_indptr,
++            dense_page_idx_kv,
++            seq_lens_kv,
++        )
++        return out
++
+     @flashinfer_api
+     def run(
+         self,
 diff --git a/decode.py b/decode.py
-index 25bd11c8d8501c3d3ed6759598f4b5da12d8db08..a3f21be0204bac6dcf7353ac2793b6834bcf21c2 100644
+index b6230b077998a3b62622b352222b8198b4660922..a796e15bb30d91c535a89e65c68730e079bde5e1 100644
 --- a/decode.py
 +++ b/decode.py
 @@ -1,3 +1,4 @@
@@ -83,7 +129,7 @@ index 25bd11c8d8501c3d3ed6759598f4b5da12d8db08..a3f21be0204bac6dcf7353ac2793b683
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -24,13 +25,7 @@ from typing import TYPE_CHECKING, Literal, Optional, Union
+@@ -25,13 +26,7 @@ from typing import TYPE_CHECKING, Literal, Optional, Union
  
  import torch
  
@@ -98,7 +144,7 @@ index 25bd11c8d8501c3d3ed6759598f4b5da12d8db08..a3f21be0204bac6dcf7353ac2793b683
  from ._tensor_aliasing import (
      _validate_out_does_not_overlap_inputs,
      _validate_tensor_does_not_overlap_inputs,
-@@ -1808,7 +1803,7 @@ def _launch_decode(
+@@ -1813,7 +1808,7 @@ def _launch_decode(
      return runtime.out
  
  
@@ -107,7 +153,47 @@ index 25bd11c8d8501c3d3ed6759598f4b5da12d8db08..a3f21be0204bac6dcf7353ac2793b683
  def prims_ts_batch_decode_with_kv_cache(
      query: torch.Tensor,
      kv_cache: PagedKVCache,
-@@ -2356,9 +2351,14 @@ class BatchDecodePagedTSWrapper:
+@@ -2070,6 +2065,7 @@ class BatchDecodePagedTSWrapper:
+         window_left: int = -1,
+         max_kv_len: Optional[int] = None,
+         live_metadata: bool = False,
++        enable_pdl: bool = False,
+         workspace_buffer: Optional[torch.Tensor] = None,
+     ) -> None:
+         """Prepare native CSR metadata, policy, compiled callables, and scratch.
+@@ -2114,6 +2110,13 @@ class BatchDecodePagedTSWrapper:
+         Callers own all value contracts described by
+         :func:`prims_ts_batch_decode_with_kv_cache`.
+ 
++        ``enable_pdl=True`` compiles the main launch into an external
++        programmatic-dependent-launch chain: it waits for the preceding grid
++        and publishes the following grid once it may launch. This option is a
++        compile-cache key. It is independent of the internal main-to-reducer
++        PDL ordering, which remains enabled whenever a standalone reducer is
++        selected.
++
+         ``workspace_buffer`` overrides the constructor workspace for this plan,
+         allowing one facade to replan after an eager/graph workspace switch.
+         An external workspace is initialized only while a plan is bound;
+@@ -2124,6 +2127,8 @@ class BatchDecodePagedTSWrapper:
+         unsupported.
+         """
+ 
++        if type(enable_pdl) is not bool:
++            raise TypeError("enable_pdl must be a bool")
+         if not isinstance(live_metadata, bool):
+             raise TypeError("live_metadata must be a bool")
+         if live_metadata and paged_kv_last_page_len is not None:
+@@ -2292,7 +2297,7 @@ class BatchDecodePagedTSWrapper:
+                 max_kv_len=exact_max_kv_len,
+             )
+         compiled_main, compiled_reducer, policy, scratch_shapes = _get_compiled_decode(
+-            *semantic_key, kv_prefix_mode, kv_lengths_mode
++            *semantic_key, kv_prefix_mode, kv_lengths_mode, enable_pdl
+         )
+         workspace_layout = _make_decode_workspace_layout(scratch_shapes, o_data_type)
+         bound_workspace_buffer = (
+@@ -2361,9 +2366,14 @@ class BatchDecodePagedTSWrapper:
          self._kv_prefix_mode = kv_prefix_mode
          self._kv_lengths_mode = kv_lengths_mode
          self._policy = policy
@@ -123,7 +209,7 @@ index 25bd11c8d8501c3d3ed6759598f4b5da12d8db08..a3f21be0204bac6dcf7353ac2793b683
      def run(
          self,
          q: torch.Tensor,
-@@ -2512,7 +2512,7 @@ class BatchDecodePagedTSWrapper:
+@@ -2517,7 +2527,7 @@ class BatchDecodePagedTSWrapper:
          )
  
  
@@ -132,10 +218,37 @@ index 25bd11c8d8501c3d3ed6759598f4b5da12d8db08..a3f21be0204bac6dcf7353ac2793b683
  def batch_decode_with_paged_kv_cache(
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
+diff --git a/kernels/fmha_decode/fmha_decode_config.py b/kernels/fmha_decode/fmha_decode_config.py
+index 0d2d018c85ca8b83a23dae7bc2916a6f222ca6a0..2aa9ff2eb34651c05e7698f45b2e5309f42788da 100644
+--- a/kernels/fmha_decode/fmha_decode_config.py
++++ b/kernels/fmha_decode/fmha_decode_config.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+diff --git a/kernels/fmha_decode/fmha_decode_kernel.py b/kernels/fmha_decode/fmha_decode_kernel.py
+index e17e09bffa7a49dd38c3185d7e0353c008edfca5..fb2c838504b318e341a19109583ce2380b773c57 100644
+--- a/kernels/fmha_decode/fmha_decode_kernel.py
++++ b/kernels/fmha_decode/fmha_decode_kernel.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
 diff --git a/kernels/fmha_decode/fmha_decode_tasks.py b/kernels/fmha_decode/fmha_decode_tasks.py
 index 63f00765dea6090a7e9b5bc362022b20867eceb9..f570e7b501d4662b1679641016784d9f7c60bbd7 100644
 --- a/kernels/fmha_decode/fmha_decode_tasks.py
 +++ b/kernels/fmha_decode/fmha_decode_tasks.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+diff --git a/kernels/fmha_decode/reduction.py b/kernels/fmha_decode/reduction.py
+index 747c6346f8326d72307e9fbbbb73d1e6e6fad990..65fcc5cb9b969cd29690151e0f18ba4d342acfa2 100644
+--- a/kernels/fmha_decode/reduction.py
++++ b/kernels/fmha_decode/reduction.py
 @@ -1,3 +1,4 @@
 +# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
  # Copyright (c) 2026 by FlashInfer team.

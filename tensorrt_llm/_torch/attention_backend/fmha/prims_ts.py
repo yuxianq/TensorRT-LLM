@@ -26,6 +26,7 @@ import torch
 from packaging.version import InvalidVersion, Version
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
@@ -103,6 +104,8 @@ class PrimsTSFmha(PhasedFmha):
 
     def __init__(self, attn: "TrtllmAttention") -> None:
         super().__init__(attn)
+        # Read once so cached decode plans are not sensitive to later environment changes.
+        self._enable_pdl = get_env_enable_pdl()
         self._page_indices_buffer: Optional[torch.Tensor] = None
         self._fixed_indptr_buffer: Optional[torch.Tensor] = None
         self._interleaved_indptr_buffer: Optional[torch.Tensor] = None
@@ -750,6 +753,7 @@ class PrimsTSFmha(PhasedFmha):
         batch_size: int,
         page_size: int,
         max_kv_len: int,
+        window_left: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build the live native context metadata entirely on the current stream."""
         if block_tables.ndim != 3 or block_tables.shape[1] != 2:
@@ -788,6 +792,34 @@ class PrimsTSFmha(PhasedFmha):
         logical_kv_indptr = cu_kv_seqlens[: batch_size + 1]
         seq_lens_kv = sequence_lengths[:batch_size]
         padded_pages = required_padded_pages
+        if (
+            batch_size == 1
+            and self.attn.head_dim == 128
+            and window_left < 0
+            and active_pages == padded_pages
+        ):
+            source_pages = block_tables[:1, 0:1, :active_pages]
+            source_capacity = (
+                source_pages.untyped_storage().nbytes() // source_pages.element_size()
+                - source_pages.storage_offset()
+            )
+            if (
+                source_pages.is_contiguous()
+                and source_pages.data_ptr() % 16 == 0
+                and source_capacity >= 2 * padded_pages
+            ):
+                # Paired D128 reads only plane 0 and uses separately shifted K/V
+                # pools. Plane 1 of this compact alias is therefore intentionally
+                # unspecified; D256 reads both planes and must keep using the copy.
+                return (
+                    logical_kv_indptr,
+                    seq_lens_kv,
+                    source_pages.as_strided(
+                        (1, 2, padded_pages),
+                        (2 * padded_pages, padded_pages, 1),
+                    ),
+                )
+
         dense_page_idx_kv = self._context_page_indices_buffer.view(-1)[
             : batch_size * 2 * padded_pages
         ].view(batch_size, 2, padded_pages)
@@ -953,6 +985,7 @@ class PrimsTSFmha(PhasedFmha):
             output_dtype,
             mask_type,
             window_left,
+            self._enable_pdl,
         )
         wrapper = self._decode_wrapper
         if wrapper is not None and plan_key == self._decode_wrapper_plan_key:
@@ -977,6 +1010,7 @@ class PrimsTSFmha(PhasedFmha):
             window_left=window_left,
             max_kv_len=max_kv_len,
             live_metadata=True,
+            enable_pdl=self._enable_pdl,
             workspace_buffer=workspace_buffer,
         )
         self._decode_wrapper = wrapper
@@ -1339,6 +1373,7 @@ class PrimsTSFmha(PhasedFmha):
             batch_size=params.batch_size,
             page_size=params.tokens_per_block,
             max_kv_len=int(max_kv_len),
+            window_left=int(window_left),
         )
         mask_type = self._get_prims_mask_type(fwd)
         wrapper = self._get_or_plan_context_wrapper(
@@ -1356,15 +1391,16 @@ class PrimsTSFmha(PhasedFmha):
             sm_scale=self._get_bmm1_scale(attn),
             output_dtype=params.context_buf.dtype,
         )
-        wrapper.run(
+        # This adapter owns the cached plan and constructs every live tensor.
+        wrapper._run_live_unchecked(
             q_processed,
             k_cache,
             v_cache,
-            out=params.context_buf,
-            qo_indptr=cu_q_seqlens,
-            logical_kv_indptr=logical_kv_indptr,
-            dense_page_idx_kv=dense_page_idx_kv,
-            seq_lens_kv=seq_lens_kv,
+            params.context_buf,
+            cu_q_seqlens,
+            logical_kv_indptr,
+            dense_page_idx_kv,
+            seq_lens_kv,
         )
 
         thop.trtllm_gen_context_postprocess(

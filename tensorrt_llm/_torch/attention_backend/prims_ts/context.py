@@ -2188,6 +2188,45 @@ class BatchPrefillPagedTSWrapper:
         self._live_metadata = True
         self._planned = True
 
+    def _run_live_unchecked(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        out: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        logical_kv_indptr: torch.Tensor,
+        dense_page_idx_kv: torch.Tensor,
+        seq_lens_kv: torch.Tensor,
+        /,
+    ) -> torch.Tensor:
+        """Launch a trusted live-metadata plan without runtime validation.
+
+        Unlike :meth:`run`, this private adapter entry point does not enforce
+        the public two-plane page-table contract.  A caller that binds the
+        query-paired D128 specialization may provide a storage-bounded second
+        plane because that kernel consumes plane zero for both separately
+        shifted K/V pools.  All other plans must still provide both logical
+        planes.
+        """
+        if not self._planned:
+            raise RuntimeError("plan_live() must be called before _run_live_unchecked()")
+        if not self._live_metadata:
+            raise RuntimeError("_run_live_unchecked() requires a plan_live() plan")
+        self._compiled(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            self._scale_softmax_log2,
+            self._output_scale,
+            qo_indptr,
+            logical_kv_indptr,
+            dense_page_idx_kv,
+            seq_lens_kv,
+        )
+        return out
+
     @flashinfer_api
     def run(
         self,

@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1907,6 +1908,13 @@ def decode_gen_kernel(
         # Grid coordinates and scratch linearization retain configured fanout.
         q_group_idx = q_group_cta_idx // Int32(cfg.splits_kv)
 
+    if cutlass.const_expr(cfg.use_external_pdl):
+        prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+        if cutlass.const_expr(not cfg.use_separate_reduction_kernel):
+            pdl_thread_idx, _, _ = cute.arch.thread_idx()
+            if pdl_thread_idx == Int32(0):
+                prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
+
     q_token_offset = Int32(0)
     seq_len_q = Int32(cfg.max_seq_len_q)
     q_token_base = Int32(0)
@@ -2251,5 +2259,5 @@ def fmha_decode_launch(
             or (cfg.use_keeps_mma_ab and cfg.tile_size_q == 128)
             else 0
         ),
-        use_pdl=cfg.use_parallel_separate_reduction_pdl,
+        use_pdl=cfg.use_main_launch_pdl,
     )

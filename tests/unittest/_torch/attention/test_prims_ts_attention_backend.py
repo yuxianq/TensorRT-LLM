@@ -107,6 +107,45 @@ def test_prims_ts_qwen2_gqa(
     run_case(case)
 
 
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+def test_prims_ts_qwen2_b1_two_tile_context_aliases_native_page_table(
+    monkeypatch: pytest.MonkeyPatch,
+    use_kv_cache_manager_v2: bool,
+) -> None:
+    from tensorrt_llm._torch.attention_backend.fmha.prims_ts import PrimsTSFmha
+
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
+    original_stage_context_metadata = PrimsTSFmha._stage_context_metadata
+    alias_observed = False
+
+    def record_context_page_table_alias(self, block_tables, *args, **kwargs):
+        nonlocal alias_observed
+        metadata = original_stage_context_metadata(self, block_tables, *args, **kwargs)
+        dense_page_table = metadata[2]
+        assert dense_page_table.shape == (1, 2, 8)
+        assert dense_page_table.data_ptr() == block_tables[0, 0].data_ptr()
+        alias_observed = True
+        return metadata
+
+    monkeypatch.setattr(
+        PrimsTSFmha,
+        "_stage_context_metadata",
+        record_context_page_table_alias,
+    )
+    case = BackendCase(
+        **_QWEN2_7B,
+        seq_lens=[256],
+        num_cached_tokens=[0],
+        num_contexts=1,
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+    )
+
+    results = run_case(case)
+
+    assert "TRTLLM" in results
+    assert alias_observed
+
+
 def test_prims_ts_fp16_dense_context_with_alternate_shape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1007,6 +1046,570 @@ def test_prims_ts_decode_graph_profiles_reset_shared_workspace_a_b_a() -> None:
     for actual in actual_a:
         torch.testing.assert_close(actual, reference_a, atol=3e-2, rtol=3e-3)
     torch.testing.assert_close(actual_b, reference_b, atol=3e-2, rtol=3e-3)
+
+
+@pytest.mark.parametrize(
+    "max_seq_len",
+    [
+        pytest.param(64, id="direct"),
+        pytest.param(4096, id="cluster-smem"),
+    ],
+)
+def test_prims_ts_decode_plan_external_pdl_cuda_graph_replay_a_b_a(
+    max_seq_len: int,
+) -> None:
+    from tensorrt_llm._torch.attention_backend.prims_ts import (
+        BatchDecodePagedTSWrapper,
+        get_prims_ts_batch_decode_workspace_size,
+        prims_ts_batch_decode_with_kv_cache,
+    )
+
+    batch_size = 2
+    num_qo_heads = 8
+    num_kv_heads = 2
+    head_dim = 128
+    page_size = 32
+    dtype = torch.bfloat16
+    device = torch.device("cuda")
+    pages_per_request = max_seq_len // page_size
+    num_pages = batch_size * pages_per_request
+    query = torch.randn(
+        batch_size,
+        num_qo_heads,
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    kv_cache = torch.randn(
+        num_pages,
+        2,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    paged_kv_indptr = (
+        torch.arange(batch_size + 1, device=device, dtype=torch.int32) * pages_per_request
+    )
+    paged_kv_indices = torch.arange(num_pages, device=device, dtype=torch.int32)
+    seq_lens = torch.tensor(
+        [max_seq_len // 2 + 1, max_seq_len],
+        device=device,
+        dtype=torch.int32,
+    )
+    # The shorter row in the long profile contracts its configured cluster fanout.
+    workspace_bytes = get_prims_ts_batch_decode_workspace_size(
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        max_seq_len,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=dtype,
+        mask_type="causal",
+        device=device,
+    )
+    reference = prims_ts_batch_decode_with_kv_cache(
+        query,
+        kv_cache,
+        torch.zeros(workspace_bytes, device=device, dtype=torch.uint8),
+        paged_kv_indptr,
+        paged_kv_indices,
+        seq_lens,
+        max_seq_len,
+        out_dtype=dtype,
+        out=torch.empty_like(query),
+        mask_type="causal",
+        kv_layout="HND",
+    ).clone()
+    workspaces = [torch.zeros(workspace_bytes, device=device, dtype=torch.uint8) for _ in range(3)]
+    outputs = [torch.empty_like(query) for _ in range(3)]
+    assert len({workspace.data_ptr() for workspace in workspaces}) == len(workspaces)
+
+    wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
+    topology_fields = (
+        "use_split_kv",
+        "splits_kv",
+        "max_splits_kv",
+        "use_separate_reduction_kernel",
+        "use_cluster_smem_reduction",
+        "use_persistent_scheduler",
+    )
+
+    def plan_capture_replay(
+        enable_pdl: bool,
+        workspace: torch.Tensor,
+        output: torch.Tensor,
+    ) -> tuple[torch.cuda.CUDAGraph, object]:
+        wrapper.plan(
+            paged_kv_indptr,
+            paged_kv_indices,
+            None,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            seq_len_q=1,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            o_data_type=dtype,
+            mask_type="causal",
+            max_kv_len=max_seq_len,
+            live_metadata=True,
+            enable_pdl=enable_pdl,
+            workspace_buffer=workspace,
+        )
+        policy = dict(wrapper._policy)
+        assert policy["use_external_pdl"] is enable_pdl
+        topology = tuple(policy[field] for field in topology_fields)
+        if max_seq_len == 64:
+            assert topology == (False, 1, 1, False, False, False)
+        else:
+            assert policy["splits_kv"] > 1
+            assert topology == (
+                True,
+                policy["splits_kv"],
+                policy["splits_kv"],
+                False,
+                True,
+                False,
+            )
+        assert wrapper._compiled_reducer is None
+        assert wrapper._kv_prefix_mode == "dynamic"
+        assert wrapper._kv_lengths_mode == "dynamic"
+        assert wrapper._paged_kv_indptr is paged_kv_indptr
+        assert wrapper._paged_kv_indices is paged_kv_indices
+
+        control_span = slice(
+            wrapper._workspace_layout.split_kv_counter.byte_offset,
+            wrapper._workspace_layout.total_bytes,
+        )
+        workspace[control_span].zero_()
+        wrapper.run(
+            query,
+            kv_cache,
+            seq_lens,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=paged_kv_indices,
+            out=output,
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            workspace[control_span].zero_()
+            graph_output = wrapper.run(
+                query,
+                kv_cache,
+                seq_lens,
+                paged_kv_indptr=paged_kv_indptr,
+                paged_kv_indices=paged_kv_indices,
+                out=output,
+            )
+
+        workspace[control_span].fill_(0xFF)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.count_nonzero(workspace[control_span]) == 0
+        assert graph_output.data_ptr() == output.data_ptr()
+        torch.testing.assert_close(graph_output, reference, atol=3e-2, rtol=3e-3)
+        return graph, wrapper._compiled_main
+
+    graphs = []
+    compiled_main = []
+    for enable_pdl, workspace, output in zip(
+        (False, True, False), workspaces, outputs, strict=True
+    ):
+        graph, compiled = plan_capture_replay(enable_pdl, workspace, output)
+        graphs.append(graph)
+        compiled_main.append(compiled)
+
+    assert len(graphs) == 3
+    assert compiled_main[1] is not compiled_main[0]
+    assert compiled_main[2] is compiled_main[0]
+    assert wrapper._workspace_buffer is workspaces[-1]
+
+
+def test_prims_ts_decode_packed_external_pdl_inactive_cuda_graph() -> None:
+    from tensorrt_llm._torch.attention_backend.prims_ts import (
+        BatchDecodePagedTSWrapper,
+        get_prims_ts_batch_decode_workspace_size,
+        prims_ts_batch_decode_with_kv_cache,
+    )
+
+    batch_size = 2
+    num_qo_heads = 8
+    num_kv_heads = 2
+    head_dim = 128
+    page_size = 32
+    max_seq_len = 4096
+    max_seq_len_q = 16
+    q_lengths = (1, 9)
+    dtype = torch.bfloat16
+    device = torch.device("cuda")
+    pages_per_request = max_seq_len // page_size
+    num_pages = batch_size * pages_per_request
+    query = torch.randn(
+        sum(q_lengths),
+        num_qo_heads,
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    kv_cache = torch.randn(
+        num_pages,
+        2,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    qo_indptr = torch.tensor([0, q_lengths[0], sum(q_lengths)], device=device, dtype=torch.int32)
+    paged_kv_indptr = (
+        torch.arange(batch_size + 1, device=device, dtype=torch.int32) * pages_per_request
+    )
+    paged_kv_indices = torch.arange(num_pages, device=device, dtype=torch.int32)
+    seq_lens = torch.tensor([1024, max_seq_len], device=device, dtype=torch.int32)
+    workspace_bytes = get_prims_ts_batch_decode_workspace_size(
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        max_seq_len,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=max_seq_len_q,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=dtype,
+        mask_type="causal",
+        device=device,
+    )
+    oversized_workspace_bytes = workspace_bytes + 4096
+    reference_workspace = torch.zeros(
+        oversized_workspace_bytes,
+        device=device,
+        dtype=torch.uint8,
+    )
+    reference = prims_ts_batch_decode_with_kv_cache(
+        query,
+        kv_cache,
+        reference_workspace,
+        paged_kv_indptr,
+        paged_kv_indices,
+        seq_lens,
+        max_seq_len,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=max_seq_len_q,
+        out_dtype=dtype,
+        out=torch.empty_like(query),
+        mask_type="causal",
+        kv_layout="HND",
+    ).clone()
+    workspaces = [
+        torch.zeros(
+            oversized_workspace_bytes,
+            device=device,
+            dtype=torch.uint8,
+        )
+        for _ in range(2)
+    ]
+    outputs = [torch.empty_like(query) for _ in range(2)]
+    assert len({workspace.data_ptr() for workspace in workspaces}) == len(workspaces)
+    assert max(q_lengths) < max_seq_len_q
+
+    wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
+
+    def plan_eager_capture_replay(
+        enable_pdl: bool,
+        workspace: torch.Tensor,
+        output: torch.Tensor,
+    ) -> tuple[torch.cuda.CUDAGraph, object]:
+        wrapper.plan(
+            paged_kv_indptr,
+            paged_kv_indices,
+            None,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            qo_indptr=qo_indptr,
+            max_seq_len_q=max_seq_len_q,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            o_data_type=dtype,
+            mask_type="causal",
+            max_kv_len=max_seq_len,
+            live_metadata=True,
+            enable_pdl=enable_pdl,
+            workspace_buffer=workspace,
+        )
+        policy = dict(wrapper._policy)
+        assert policy["use_external_pdl"] is enable_pdl
+        assert policy["seq_len_q"] == max_seq_len_q
+        assert policy["max_seq_len_q"] == max_seq_len_q
+        assert policy["use_packed_q"] is True
+        assert policy["query_layout"] == "TOTAL_Q_Hq_D"
+        assert policy["output_layout"] == "TOTAL_Q_Hq_D"
+        assert policy["kv_prefix_mode"] == "dynamic"
+        assert policy["kv_lengths_mode"] == "dynamic"
+        assert policy["use_split_kv"] is False
+        assert wrapper._compiled_reducer is None
+        assert wrapper._qo_indptr is qo_indptr
+
+        workspace.zero_()
+        eager_output = wrapper.run(
+            query,
+            kv_cache,
+            seq_lens,
+            qo_indptr=qo_indptr,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=paged_kv_indices,
+            out=output,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(eager_output, reference, atol=3e-2, rtol=3e-3)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            workspace.zero_()
+            graph_output = wrapper.run(
+                query,
+                kv_cache,
+                seq_lens,
+                qo_indptr=qo_indptr,
+                paged_kv_indptr=paged_kv_indptr,
+                paged_kv_indices=paged_kv_indices,
+                out=output,
+            )
+
+        workspace.fill_(0xFF)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert graph_output.data_ptr() == output.data_ptr()
+        torch.testing.assert_close(graph_output, reference, atol=3e-2, rtol=3e-3)
+        return graph, wrapper._compiled_main
+
+    graphs = []
+    compiled_main = []
+    for enable_pdl, workspace, output in zip((False, True), workspaces, outputs, strict=True):
+        graph, compiled = plan_eager_capture_replay(enable_pdl, workspace, output)
+        graphs.append(graph)
+        compiled_main.append(compiled)
+
+    assert len(graphs) == 2
+    assert compiled_main[1] is not compiled_main[0]
+
+
+def test_prims_ts_decode_separate_reducer_external_pdl_cuda_graph_a_b_a() -> None:
+    from tensorrt_llm._torch.attention_backend.prims_ts import (
+        BatchDecodePagedTSWrapper,
+        get_prims_ts_batch_decode_workspace_size,
+        prims_ts_batch_decode_with_kv_cache,
+    )
+
+    batch_size = 4
+    num_qo_heads = 128
+    num_kv_heads = 4
+    head_dim = 128
+    page_size = 32
+    seq_len_q = 4
+    max_seq_len = 8192
+    dtype = torch.float8_e4m3fn
+    device = torch.device("cuda")
+    pages_per_request = max_seq_len // page_size
+    num_pages = batch_size * pages_per_request
+    query = (
+        torch.randn(
+            batch_size,
+            seq_len_q,
+            num_qo_heads,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.25
+    ).to(dtype)
+    k_cache = (
+        torch.randn(
+            num_pages,
+            num_kv_heads,
+            page_size,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.25
+    ).to(dtype)
+    v_cache = (
+        torch.randn(
+            num_pages,
+            num_kv_heads,
+            page_size,
+            head_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.25
+    ).to(dtype)
+    kv_cache = (k_cache, v_cache)
+    paged_kv_indptr = (
+        torch.arange(batch_size + 1, device=device, dtype=torch.int32) * pages_per_request
+    )
+    paged_kv_indices = torch.arange(num_pages, device=device, dtype=torch.int32)
+    seq_lens = torch.tensor(
+        [1024, 3072, 6144, max_seq_len],
+        device=device,
+        dtype=torch.int32,
+    )
+    workspace_bytes = get_prims_ts_batch_decode_workspace_size(
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        max_seq_len,
+        seq_len_q=seq_len_q,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=dtype,
+        mask_type="causal",
+        device=device,
+    )
+    oversized_workspace_bytes = workspace_bytes + 4096
+    reference_workspace = torch.zeros(
+        oversized_workspace_bytes,
+        device=device,
+        dtype=torch.uint8,
+    )
+    reference = prims_ts_batch_decode_with_kv_cache(
+        query,
+        kv_cache,
+        reference_workspace,
+        paged_kv_indptr,
+        paged_kv_indices,
+        seq_lens,
+        max_seq_len,
+        seq_len_q=seq_len_q,
+        out_dtype=dtype,
+        out=torch.empty_like(query),
+        mask_type="causal",
+        kv_layout="HND",
+    ).clone()
+    workspaces = [
+        torch.zeros(
+            oversized_workspace_bytes,
+            device=device,
+            dtype=torch.uint8,
+        )
+        for _ in range(3)
+    ]
+    outputs = [torch.empty_like(query) for _ in range(3)]
+    assert len({workspace.data_ptr() for workspace in workspaces}) == len(workspaces)
+
+    wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
+    expected_topology = (True, 8, 8, True, False, False)
+    topology_fields = (
+        "use_split_kv",
+        "splits_kv",
+        "max_splits_kv",
+        "use_separate_reduction_kernel",
+        "use_cluster_smem_reduction",
+        "use_persistent_scheduler",
+    )
+
+    def plan_eager_capture_replay(
+        enable_pdl: bool,
+        workspace: torch.Tensor,
+        output: torch.Tensor,
+    ) -> tuple[torch.cuda.CUDAGraph, object, object]:
+        wrapper.plan(
+            paged_kv_indptr,
+            paged_kv_indices,
+            None,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            seq_len_q=seq_len_q,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            o_data_type=dtype,
+            mask_type="causal",
+            max_kv_len=max_seq_len,
+            live_metadata=True,
+            enable_pdl=enable_pdl,
+            workspace_buffer=workspace,
+        )
+        policy = dict(wrapper._policy)
+        assert policy["use_external_pdl"] is enable_pdl
+        assert tuple(policy[field] for field in topology_fields) == expected_topology
+        assert policy["use_packed_q"] is False
+        assert policy["query_layout"] == "B_SQ_Hq_D"
+        assert policy["output_layout"] == "B_SQ_Hq_D"
+        assert policy["kv_prefix_mode"] == "dynamic"
+        assert policy["kv_lengths_mode"] == "dynamic"
+        assert wrapper._compiled_reducer is not None
+
+        workspace.zero_()
+        eager_output = wrapper.run(
+            query,
+            kv_cache,
+            seq_lens,
+            paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indices=paged_kv_indices,
+            out=output,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            eager_output.float(),
+            reference.float(),
+            atol=0,
+            rtol=0,
+        )
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            workspace.zero_()
+            graph_output = wrapper.run(
+                query,
+                kv_cache,
+                seq_lens,
+                paged_kv_indptr=paged_kv_indptr,
+                paged_kv_indices=paged_kv_indices,
+                out=output,
+            )
+
+        workspace.fill_(0xFF)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert graph_output.data_ptr() == output.data_ptr()
+        torch.testing.assert_close(
+            graph_output.float(),
+            reference.float(),
+            atol=0,
+            rtol=0,
+        )
+        return graph, wrapper._compiled_main, wrapper._compiled_reducer
+
+    graphs = []
+    compiled_main = []
+    compiled_reducer = []
+    for enable_pdl, workspace, output in zip(
+        (False, True, False), workspaces, outputs, strict=True
+    ):
+        graph, main, reducer = plan_eager_capture_replay(enable_pdl, workspace, output)
+        graphs.append(graph)
+        compiled_main.append(main)
+        compiled_reducer.append(reducer)
+
+    assert len(graphs) == 3
+    assert compiled_main[1] is not compiled_main[0]
+    assert compiled_main[2] is compiled_main[0]
+    assert compiled_reducer[1] is not compiled_reducer[0]
+    assert compiled_reducer[2] is compiled_reducer[0]
 
 
 def test_prims_ts_decode_wrappers_share_workspace_across_serialized_layers() -> None:
