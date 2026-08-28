@@ -2,12 +2,12 @@ schema_version: 1
 vendors:
   flashinfer-prims-ts:
     url: https://github.com/yuxianq/flashinfer.git
-    branch: trtllm-prims-ts
-    commit: dadd92a26ec0be8f2402967eff6a22f0caf11544
+    branch: trtllm-prims-ts-reusable-wrappers
+    commit: f493fb93d9564e718b84fda5662f0c59cdcbbf47
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention_backend/prims_ts
     include:
     - '**/*.py'
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
-    patch_digest: sha256:3b7b774a416d6036f3a80125cba88e2d8e468d6b2e08ab3a43dbb539869372cd
-    digest: sha256-tree-v1:2992bc0e85a2cef44e5a372451d2653a1705075130e18e20c1b9b3bd5b9150c4
+    patch_digest: sha256:9db4dc953c79b1ce3ab86ff33eec142456831b57d50659c2e8d04f5dac632935
+    digest: sha256-tree-v1:f637e0c2d4cc0466f0ab229b97ed21ce24221ac6e9fe125600144a0ed6a84da0

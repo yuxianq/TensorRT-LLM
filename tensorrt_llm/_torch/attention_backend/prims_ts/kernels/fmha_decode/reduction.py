@@ -455,6 +455,11 @@ def decode_gen_parallel_separate_reduction_kernel(
     if cutlass.const_expr(cfg.use_parallel_separate_reduction_pdl):
         prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
+    if cutlass.const_expr(cfg.use_external_pdl):
+        pdl_thread_idx, _, _ = cute.arch.thread_idx()
+        if pdl_thread_idx == Int32(0):
+            prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
+
     if cutlass.const_expr(cfg.use_compact_parallel_reduction):
         _reduce_exact_splits_body(
             o_iter,
