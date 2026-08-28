@@ -56,7 +56,7 @@ index 0000000000000000000000000000000000000000..59238dbc477df3b8068a9e56559ad1c5
 +
 +    return decorator
 diff --git a/context.py b/context.py
-index 85ff8ff4ba943254455ed1cdf809e0c5aa568a51..ca3b4e2df9f3fd3774d538487a0887de2854249e 100644
+index 69b349129d59e3ef989cdf1b344501efd3642424..6e60c572b0b82ce7f33334d27ab473bf170d7d40 100644
 --- a/context.py
 +++ b/context.py
 @@ -1,3 +1,4 @@
@@ -75,7 +75,7 @@ index 85ff8ff4ba943254455ed1cdf809e0c5aa568a51..ca3b4e2df9f3fd3774d538487a0887de
  
  
 diff --git a/decode.py b/decode.py
-index a39364d26860462b316271f8ed6e8cb3083d9dee..3a3d54f0aebb2b3578711c9d225714745791e9dd 100644
+index 25bd11c8d8501c3d3ed6759598f4b5da12d8db08..a3f21be0204bac6dcf7353ac2793b6834bcf21c2 100644
 --- a/decode.py
 +++ b/decode.py
 @@ -1,3 +1,4 @@
@@ -98,7 +98,7 @@ index a39364d26860462b316271f8ed6e8cb3083d9dee..3a3d54f0aebb2b3578711c9d22571474
  from ._tensor_aliasing import (
      _validate_out_does_not_overlap_inputs,
      _validate_tensor_does_not_overlap_inputs,
-@@ -1771,7 +1766,7 @@ def _launch_decode(
+@@ -1808,7 +1803,7 @@ def _launch_decode(
      return runtime.out
  
  
@@ -107,8 +107,15 @@ index a39364d26860462b316271f8ed6e8cb3083d9dee..3a3d54f0aebb2b3578711c9d22571474
  def prims_ts_batch_decode_with_kv_cache(
      query: torch.Tensor,
      kv_cache: PagedKVCache,
-@@ -2216,7 +2211,7 @@ class BatchDecodePagedTSWrapper:
+@@ -2356,9 +2351,14 @@ class BatchDecodePagedTSWrapper:
+         self._kv_prefix_mode = kv_prefix_mode
+         self._kv_lengths_mode = kv_lengths_mode
          self._policy = policy
++        policy_fields = dict(policy)
++        self._requires_control_reset = bool(policy_fields["use_split_kv"]) and not (
++            bool(policy_fields["use_separate_reduction_kernel"])
++            or bool(policy_fields["use_cluster_smem_reduction"])
++        )
          self._planned = True
  
 -    @flashinfer_api(trace=prims_ts_decode_wrapper_trace_dispatch)
@@ -116,7 +123,7 @@ index a39364d26860462b316271f8ed6e8cb3083d9dee..3a3d54f0aebb2b3578711c9d22571474
      def run(
          self,
          q: torch.Tensor,
-@@ -2290,7 +2285,7 @@ class BatchDecodePagedTSWrapper:
+@@ -2512,7 +2512,7 @@ class BatchDecodePagedTSWrapper:
          )
  
  
@@ -125,8 +132,17 @@ index a39364d26860462b316271f8ed6e8cb3083d9dee..3a3d54f0aebb2b3578711c9d22571474
  def batch_decode_with_paged_kv_cache(
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
+diff --git a/kernels/fmha_decode/fmha_decode_tasks.py b/kernels/fmha_decode/fmha_decode_tasks.py
+index 63f00765dea6090a7e9b5bc362022b20867eceb9..f570e7b501d4662b1679641016784d9f7c60bbd7 100644
+--- a/kernels/fmha_decode/fmha_decode_tasks.py
++++ b/kernels/fmha_decode/fmha_decode_tasks.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
 diff --git a/mla_decode.py b/mla_decode.py
-index 38ed8fbd9e0499150588b9f90babe3d890d14a9f..4969316707df2af7e5d4ce2f76fccc6962151ca1 100644
+index eec8cd4af84b38e084c45e888f779489f3816dce..22cd3d07f9cc91d21e13d4c3cf474d34a973a8fc 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
@@ -158,7 +174,7 @@ index 38ed8fbd9e0499150588b9f90babe3d890d14a9f..4969316707df2af7e5d4ce2f76fccc69
  def prims_ts_batch_decode_with_kv_cache_mla(
      query: torch.Tensor,
      kv_cache: torch.Tensor,
-@@ -1746,7 +1741,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -1861,7 +1856,7 @@ class BatchMLADecodePagedTSWrapper:
          self._split_kv = int(dict(policy)["split_kv"])
          self._planned = True
  
@@ -167,7 +183,7 @@ index 38ed8fbd9e0499150588b9f90babe3d890d14a9f..4969316707df2af7e5d4ce2f76fccc69
      def run(
          self,
          query: torch.Tensor,
-@@ -1805,7 +1800,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -1942,7 +1937,7 @@ class BatchMLADecodePagedTSWrapper:
          )
  
  

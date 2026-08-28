@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,6 +53,7 @@ from .fmha_decode_config import FmhaDecodeConfig
 from .fmha_decode_constants import KV_INST0, KV_INST1, KV_KIND_K, KV_KIND_V
 from .fmha_decode_resources.helpers_common import _q_group_token_base, _q_seq_bounds
 from .fmha_decode_resources.helpers_kv_tile_idx import (
+    _runtime_last_valid_page_idx,
     _runtime_total_kv_tiles,
     _sliding_window_start_idx,
 )
@@ -691,12 +693,21 @@ class DecodeGenTask(Task):
             self._kv_request_begin = request_begin
             self._kv_page_idx_ub = request_end - request_begin - cutlass.Int32(1)
         if self.seqlens_kv is None:
-            if not self.cfg.use_split_kv and not self.cfg.uses_runtime_q_kv_union:
-                return self.domain
             seq_len_kv = cutlass.Int32(self.max_seq_len_kv)
         else:
             seq_len_kv = cutlass.Int32(self.seqlens_kv[b_idx])
         self._seq_len_kv = seq_len_kv
+        if cutlass.const_expr(self.paged_kv_indptr is not None):
+            self._kv_page_idx_ub = cute.math.min(
+                self._kv_page_idx_ub,
+                _runtime_last_valid_page_idx(self.cfg, seq_len_kv),
+            )
+        if (
+            self.seqlens_kv is None
+            and not self.cfg.use_split_kv
+            and not self.cfg.uses_runtime_q_kv_union
+        ):
+            return self.domain
         tile_size_kv = cutlass.Int32(self.cfg.tile_size_kv)
 
         # Decode the logical Q tile with the configured physical split fanout,

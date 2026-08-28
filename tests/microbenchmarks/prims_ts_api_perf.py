@@ -944,10 +944,12 @@ def _qwen_case(args: argparse.Namespace) -> dict[str, object]:
     control_span_end = live_wrapper._workspace_layout.total_bytes
     live_control_span = live_workspace[control_span_offset:control_span_end]
 
-    def live_adapter_control_zero_plus_run() -> torch.Tensor:
-        # Match PrimsTSFmha.run_generation when the workspace slab may have
-        # been used by another layout or captured graph.
-        live_control_span.zero_()
+    requires_control_reset = live_wrapper._requires_control_reset
+
+    def live_adapter_control_reset_if_required_plus_run() -> torch.Tensor:
+        # Match PrimsTSFmha.run_generation for a shared workspace slab.
+        if requires_control_reset:
+            live_control_span.zero_()
         return live_run(live_adapter_out)
 
     def legacy_one_shot_construct_plan_run() -> torch.Tensor:
@@ -975,7 +977,9 @@ def _qwen_case(args: argparse.Namespace) -> dict[str, object]:
             "workspace_zero_plus_raw": workspace_zero_plus_raw(),
             "legacy_wrapper_retained_metadata": legacy_cached_run(),
             "live_wrapper_external_workspace": live_cached_run(),
-            "live_wrapper_adapter_control_zero_plus_run": (live_adapter_control_zero_plus_run()),
+            "live_wrapper_adapter_control_reset_if_required_plus_run": (
+                live_adapter_control_reset_if_required_plus_run()
+            ),
             "legacy_one_shot_construct_plan_run": legacy_one_shot_construct_plan_run(),
         },
     )
@@ -999,7 +1003,7 @@ def _qwen_case(args: argparse.Namespace) -> dict[str, object]:
         reference_b,
         {
             "live_wrapper_adapter_path_after_in_place_metadata_mutation": (
-                live_adapter_control_zero_plus_run()
+                live_adapter_control_reset_if_required_plus_run()
             )
         },
     )
@@ -1010,7 +1014,7 @@ def _qwen_case(args: argparse.Namespace) -> dict[str, object]:
         reference_a,
         {
             "live_wrapper_adapter_path_after_restoring_original_metadata": (
-                live_adapter_control_zero_plus_run()
+                live_adapter_control_reset_if_required_plus_run()
             )
         },
     )
@@ -1019,8 +1023,8 @@ def _qwen_case(args: argparse.Namespace) -> dict[str, object]:
         "raw_workspace_zero_plus_api_call": workspace_zero_plus_raw,
         "legacy_wrapper_retained_metadata_run_only": legacy_cached_run,
         "live_wrapper_external_workspace_run_only_dedicated_layout": live_cached_run,
-        "live_wrapper_adapter_control_span_zero_plus_run_shared_layout": (
-            live_adapter_control_zero_plus_run
+        "live_wrapper_adapter_control_reset_if_required_plus_run_shared_layout": (
+            live_adapter_control_reset_if_required_plus_run
         ),
         "legacy_one_shot_construct_plan_run": legacy_one_shot_construct_plan_run,
     }
@@ -1089,8 +1093,8 @@ def _qwen_case(args: argparse.Namespace) -> dict[str, object]:
             "live_wrapper": (
                 "Every run reads CSR and sequence lengths within the planned static "
                 "bounds. Run-only timing assumes a dedicated workspace with an "
-                "identical layout; the adapter-matched timing first zeros the control "
-                "span so a serialized shared slab cannot carry stale control values."
+                "identical layout; the adapter-matched timing zeros the control span "
+                "only when the resolved fused global-memory reduction consumes it."
             ),
         },
         "workspace_bytes": {
@@ -1101,6 +1105,7 @@ def _qwen_case(args: argparse.Namespace) -> dict[str, object]:
             "live_external_allocated": _tensor_bytes(live_workspace),
             "live_adapter_control_span_offset": control_span_offset,
             "live_adapter_control_span_bytes": control_span_end - control_span_offset,
+            "live_adapter_requires_control_reset": requires_control_reset,
         },
         "plan_timing_allocation_semantics": {
             "legacy_wrapper": (
@@ -1136,7 +1141,7 @@ def _qwen_case(args: argparse.Namespace) -> dict[str, object]:
             "max_abs_diff": live_metadata_correctness,
             "a_b_a_max_abs_diff": {
                 "reference_a_vs_initial_live_a": correctness[
-                    "live_wrapper_adapter_control_zero_plus_run"
+                    "live_wrapper_adapter_control_reset_if_required_plus_run"
                 ],
                 "reference_a_vs_reference_b": reference_a_vs_reference_b,
                 "reference_b_vs_live_b": live_metadata_correctness[

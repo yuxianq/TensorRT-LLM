@@ -278,10 +278,10 @@ The FMHA package is split by role:
   through to the next library.
   The complete `prims_ts` Python source tree is managed as the
   `flashinfer-prims-ts` vendor. Its lock selects
-  [`flashinfer/attention/prims_ts` source](https://github.com/yuxianq/flashinfer/tree/ca9b08ae1fe894545300db42cbeff6151f2204b9/flashinfer/attention/prims_ts)
+  [`flashinfer/attention/prims_ts` source](https://github.com/yuxianq/flashinfer/tree/be871575cde6789c5452266754fce3fc683d20c9/flashinfer/attention/prims_ts)
   from the `trtllm-prims-ts-reusable-wrappers` branch of
   [`yuxianq/flashinfer`](https://github.com/yuxianq/flashinfer) at commit
-  `ca9b08ae1fe894545300db42cbeff6151f2204b9`, excludes the upstream README
+  `be871575cde6789c5452266754fce3fc683d20c9`, excludes the upstream README
   files, and applies the recorded TRT-LLM compatibility patch. Exact upstream
   files retain FlashInfer's headers. Before editing this tree, read the
   [vendored-source lifecycle](../../../3rdparty/vendor-sources.md). Use a
