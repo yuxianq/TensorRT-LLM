@@ -2531,6 +2531,11 @@ class BatchDecodePagedTSWrapper:
         self._kv_prefix_mode = kv_prefix_mode
         self._kv_lengths_mode = kv_lengths_mode
         self._policy = policy
+        policy_fields = dict(policy)
+        self._requires_control_reset = bool(policy_fields["use_split_kv"]) and not (
+            bool(policy_fields["use_separate_reduction_kernel"])
+            or bool(policy_fields["use_cluster_smem_reduction"])
+        )
         self._planned = True
 
     @flashinfer_api
