@@ -18,9 +18,11 @@
 from __future__ import annotations
 
 import math
+import weakref
+from dataclasses import dataclass
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, cast
 
 import torch
 from packaging.version import InvalidVersion, Version
@@ -52,6 +54,55 @@ if TYPE_CHECKING:
 _MIN_CUTLASS_DSL_VERSION = Version("4.7.0")
 _MIN_CUTLASS_COMPILER_VERSION = "13.3"
 _WORKSPACE_ALIGNMENT = 32
+_KV_CACHE_QUANT_MODE_MASK = int(
+    QuantMode.INT8_KV_CACHE | QuantMode.FP8_KV_CACHE | QuantMode.NVFP4_KV_CACHE
+)
+_SUPPORTED_MASK_TYPE_VALUES = (
+    int(AttentionMaskType.causal),
+    int(AttentionMaskType.padding),
+)
+class _WeakIdentity:
+    """Weak identity value that cannot match a recycled Python object ID."""
+
+    __slots__ = ("_object_id", "_ref")
+
+    def __init__(self, value: object) -> None:
+        self._object_id = id(value)
+        self._ref = weakref.ref(value)
+
+    def get(self) -> Optional[object]:
+        return self._ref()
+
+    def __hash__(self) -> int:
+        return self._object_id
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _WeakIdentity):
+            return NotImplemented
+        value = self._ref()
+        return value is not None and value is other._ref()
+
+
+@dataclass(slots=True, eq=False)
+class _V2KvPageOffsetBinding:
+    manager_identity: _WeakIdentity
+    manager_impl_id: int
+    pool_mapping: torch.Tensor
+    pool_mapping_shape: tuple[int, ...]
+    pool_mapping_version: Optional[int]
+    kv_offsets: torch.Tensor
+    kv_offsets_shape: tuple[int, ...]
+    kv_offsets_version: Optional[int]
+    local_layer_idx: int
+    pool_index: int
+    kv_page_offset: int
+
+
+@dataclass(slots=True, eq=False)
+class _DenseContextPageAlias:
+    source: torch.Tensor
+    source_key: tuple[object, ...]
+    dense_page_idx_kv: torch.Tensor
 
 
 def _get_prims_decode_workspace_size(*args, **kwargs) -> int:
@@ -115,7 +166,9 @@ class PrimsTSFmha(PhasedFmha):
         self._metadata_column_capacity = 0
         self._context_metadata_row_capacity = 0
         self._context_page_column_capacity = 0
+        self._dense_context_page_alias: Optional[_DenseContextPageAlias] = None
         self._kv_page_offset_cache: dict[tuple[int, int], int] = {}
+        self._v2_kv_page_offset_binding: Optional[_V2KvPageOffsetBinding] = None
         self._multi_processor_count: Optional[int] = None
         self._retained_metadata_buffers: list[tuple[torch.Tensor, ...]] = []
         # Every other plan attribute is fixed by this layer/model instance.
@@ -216,6 +269,14 @@ class PrimsTSFmha(PhasedFmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
+        support_key = self._get_b1_context_support_key(q, k, v, self.attn, metadata, forward_args)
+        cached_support_key = getattr(metadata, "_prims_ts_b1_context_support_key", None)
+        if support_key is not None and support_key == cached_support_key:
+            # Capture can begin between layers in piecewise graph warmup. A
+            # cached key must therefore recheck the live stream.
+            if not torch.cuda.is_current_stream_capturing():
+                return True
+
         supported, reason = self._is_supported_with_reason(
             q,
             k,
@@ -225,9 +286,299 @@ class PrimsTSFmha(PhasedFmha):
             forward_args,
             phase=phase,
         )
+        if supported and support_key is not None and cached_support_key is None:
+            metadata._prims_ts_b1_context_support_key = support_key
         if not supported:
             logger.debug(f"PrimTS FMHA does not support request: {reason}")
         return supported
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+    ) -> None:
+        if metadata.num_contexts != 1 or metadata.num_generations != 0:
+            return super().forward(q, k, v, metadata, forward_args)
+
+        output = forward_args.output
+        if output is None:
+            raise RuntimeError(f"{type(self).__name__} requires output.")
+        if self.REQUIRES_PAGED_KV and metadata.kv_cache_block_offsets is None:
+            raise RuntimeError(f"{type(self).__name__} requires paged KV cache.")
+
+        input_type = forward_args.attention_input_type
+        num_ctx_tokens = metadata.num_ctx_tokens
+        if (
+            input_type not in (AttentionInputType.context_only, AttentionInputType.mixed)
+            or num_ctx_tokens <= 0
+            or q.size(0) != num_ctx_tokens
+        ):
+            return super().forward(q, k, v, metadata, forward_args)
+
+        attn = self.attn
+        if attn.is_mla_enable:
+            return super().forward(q, k, v, metadata, forward_args)
+        runtime_lengths = (
+            getattr(metadata, "kv_lens_cuda_runtime", None),
+            getattr(metadata, "kv_lens_runtime", None),
+            getattr(metadata, "prompt_lens_cuda_runtime", None),
+            getattr(metadata, "prompt_lens_cpu_runtime", None),
+        )
+        if any(
+            not isinstance(lengths, torch.Tensor) or lengths.ndim != 1 or lengths.numel() != 1
+            for lengths in runtime_lengths
+        ):
+            return super().forward(q, k, v, metadata, forward_args)
+
+        workspace = cast(torch.Tensor, metadata.effective_workspace)
+        fp8_context_fmha = self.get_fp8_context_fmha(
+            q,
+            output,
+            metadata,
+            forward_args,
+            False,
+        )
+        self.prepare_workspace(
+            q,
+            k,
+            v,
+            metadata,
+            forward_args,
+            workspace,
+        )
+
+        out_tensor = output.view(
+            num_ctx_tokens,
+            attn.num_heads,
+            self.context_out_head_size,
+        )
+        attention_window_size = forward_args.attention_window_size
+        cache_indirection = metadata.cache_indirection
+        max_attention_window_size = (
+            attention_window_size
+            if metadata.beam_width == 1
+            else (
+                cache_indirection.size(2)
+                if cache_indirection is not None
+                else attention_window_size
+            )
+        )
+        tokens_per_block = (
+            metadata.tokens_per_block if metadata.tokens_per_block is not None else 64
+        )
+        params = FmhaParams(
+            attn=attn,
+            meta=metadata,
+            fwd=forward_args,
+            workspace=workspace,
+            max_attention_window_size=max_attention_window_size,
+            cyclic_attention_window_size=attention_window_size,
+            tokens_per_block=tokens_per_block,
+            fp8_context_fmha=fp8_context_fmha,
+            kv_factor=self.kv_factor,
+            total_num_blocks=self._get_total_num_blocks(metadata),
+            is_cross=metadata.is_cross,
+        )
+        kv_lens_cuda = metadata.kv_lens_cuda_runtime
+        kv_lens_cpu = metadata.kv_lens_runtime
+        prompt_lens_cuda = metadata.prompt_lens_cuda_runtime
+        prompt_lens_cpu = metadata.prompt_lens_cpu_runtime
+        input_seq_length = int(prompt_lens_cpu[0])
+        max_past_kv_length = int(kv_lens_cpu[0])
+        params.attention_input = q
+        params.qkv_input = q
+        params.context_buf = out_tensor
+        params.sequence_lengths = kv_lens_cuda
+        params.context_lengths = prompt_lens_cuda
+        params.max_past_kv_length = max_past_kv_length
+        params.num_tokens = num_ctx_tokens
+        params.seq_offset = 0
+        params.input_seq_length = input_seq_length
+        params.batch_size = 1
+        self.run_context(params)
+
+    def _get_b1_context_support_key(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        attn: "TrtllmAttention",
+        meta: "TrtllmAttentionMetadata",
+        fwd: AttentionForwardArgs,
+    ) -> Optional[tuple[object, ...]]:
+        """Build a cheap positive-certificate key for dense B1 context."""
+        input_type = fwd.attention_input_type
+        if (
+            meta.is_cuda_graph
+            or meta.is_cross
+            or meta.num_contexts != 1
+            or meta.num_generations != 0
+            or input_type not in (AttentionInputType.context_only, AttentionInputType.mixed)
+            or k is not None
+            or v is not None
+            or not fwd.is_fused_qkv
+            or attn.is_mla_enable
+        ):
+            return None
+
+        manager = meta.kv_cache_manager
+        manager_impl = getattr(manager, "impl", None)
+        if (
+            manager is None
+            or not callable(getattr(manager_impl, "get_page_index_upper_bound", None))
+            or manager.enable_swa_scratch_reuse
+            or manager.num_pools != 1
+            or meta.kv_cache_block_offsets is None
+            or meta.host_kv_cache_pool_pointers is None
+            or meta.host_kv_cache_pool_mapping is None
+            or meta.kv_layout != "HND"
+        ):
+            return None
+
+        if (
+            meta.beam_width != 1
+            or meta.is_spec_decoding_enabled
+            or meta.use_spec_decoding
+            or meta.is_spec_dec_tree
+            or meta.is_spec_dec_dynamic_tree
+        ):
+            return None
+        runtime_features = meta.runtime_features
+        if runtime_features is not None and (
+            runtime_features.chunked_prefill
+            or runtime_features.cache_reuse
+            or runtime_features.has_speculative_draft_tokens
+        ):
+            return None
+
+        output = fwd.output
+        if (
+            q.device.type != "cuda"
+            or not q.is_contiguous()
+            or q.ndim != 2
+            or output is None
+            or output.device != q.device
+            or not output.is_contiguous()
+            or fwd.output_sf is not None
+            or fwd.out_scale is not None
+        ):
+            return None
+
+        sparse_prediction = fwd.sparse_prediction
+        if (
+            attn.sparse_params is not None
+            or meta.num_sparse_topk > 0
+            or meta.helix_position_offsets is not None
+            or fwd.relative_attention_bias is not None
+            or fwd.attention_sinks is not None
+            or fwd.attention_mask_data is not None
+            or fwd.enable_dsv4_epilogue_fusion
+            or fwd.sage_attn_num_elts_per_blk_q > 0
+            or fwd.sage_attn_num_elts_per_blk_k > 0
+            or fwd.sage_attn_num_elts_per_blk_v > 0
+            or (
+                sparse_prediction is not None
+                and (
+                    sparse_prediction.sparse_kv_indices is not None
+                    or sparse_prediction.sparse_attn_indices is not None
+                )
+            )
+        ):
+            return None
+
+        try:
+            mask_type = int(fwd.mask_type)
+            position_embedding_type = int(attn.position_embedding_type)
+            quant_mode = int(attn.quant_mode)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if (
+            mask_type not in _SUPPORTED_MASK_TYPE_VALUES
+            or position_embedding_type in (4, 5, 6, 7, 10)
+            or quant_mode & _KV_CACHE_QUANT_MODE_MASK
+            or (attn.attention_chunk_size or 0) != 0
+        ):
+            return None
+
+        num_heads = attn.num_heads
+        num_kv_heads = attn.num_kv_heads
+        head_dim = attn.head_dim
+        if (
+            num_heads <= 0
+            or num_kv_heads <= 0
+            or num_heads % num_kv_heads != 0
+            or head_dim not in self.SUPPORTED_CONTEXT_HEAD_DIMS
+        ):
+            return None
+
+        cache_dtype = binding_to_torch_dtype(meta.kv_cache_manager.dtype)
+        expected_width = (num_heads + 2 * num_kv_heads) * head_dim
+        num_ctx_tokens = meta.num_ctx_tokens
+        if (
+            q.dtype not in self.SUPPORTED_DTYPES
+            or cache_dtype != q.dtype
+            or output.dtype != q.dtype
+            or q.shape[0] != num_ctx_tokens
+            or q.shape[1] != expected_width
+            or output.numel() != q.shape[0] * num_heads * head_dim
+        ):
+            return None
+
+        tokens_per_block = meta.tokens_per_block
+        if tokens_per_block not in self.SUPPORTED_PAGE_SIZES:
+            return None
+        max_seq_len = meta.max_seq_len
+        attention_window_size = fwd.attention_window_size
+        if (
+            max_seq_len <= 0
+            or not isinstance(attention_window_size, int)
+            or attention_window_size < max_seq_len
+        ):
+            return None
+
+        binding = self._get_v2_kv_page_offset_binding(attn, meta)
+        if (
+            binding is None
+            or binding.pool_mapping_version is None
+            or binding.kv_offsets_version is None
+        ):
+            return None
+        pool_index = binding.pool_index
+        kv_page_offset = binding.kv_page_offset
+
+        return (
+            q.device,
+            q.dtype,
+            q.shape[0],
+            q.shape[1],
+            output.dtype,
+            output.numel(),
+            input_type,
+            mask_type,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            position_embedding_type,
+            int(quant_mode),
+            int(tokens_per_block),
+            max_seq_len,
+            attention_window_size,
+            meta.kv_layout,
+            cache_dtype,
+            binding.manager_identity,
+            binding.manager_impl_id,
+            id(binding.pool_mapping),
+            binding.pool_mapping_shape,
+            binding.pool_mapping_version,
+            id(binding.kv_offsets),
+            binding.kv_offsets_shape,
+            binding.kv_offsets_version,
+            pool_index,
+            kv_page_offset,
+        )
 
     def _is_supported_with_reason(
         self,
@@ -477,6 +828,142 @@ class PrimsTSFmha(PhasedFmha):
             return False, "the K-to-V page displacement could not be resolved."
         return True, ""
 
+    def _get_v2_kv_page_offset_binding(
+        self,
+        attn: "TrtllmAttention",
+        meta: "TrtllmAttentionMetadata",
+    ) -> Optional[_V2KvPageOffsetBinding]:
+        """Resolve one validated single-pool V2 layer binding."""
+        manager = meta.kv_cache_manager
+        manager_impl = getattr(manager, "impl", None)
+        if manager is None or not callable(
+            getattr(manager_impl, "get_page_index_upper_bound", None)
+        ):
+            return None
+        num_pools = getattr(manager, "num_pools", None)
+        if num_pools != 1:
+            return None
+
+        local_layer_idx = getattr(attn, "local_layer_idx", None)
+        if local_layer_idx is None:
+            get_local_layer_idx = getattr(attn, "get_local_layer_idx", None)
+            if get_local_layer_idx is None:
+                return None
+            local_layer_idx = int(get_local_layer_idx(meta))
+        if not isinstance(local_layer_idx, int) or local_layer_idx < 0:
+            return None
+
+        pool_mapping = meta.host_kv_cache_pool_mapping
+        kv_offsets = getattr(manager, "kv_offset", None)
+        if not isinstance(pool_mapping, torch.Tensor) or not isinstance(kv_offsets, torch.Tensor):
+            return None
+        pool_mapping_shape = tuple(pool_mapping.shape)
+        kv_offsets_shape = tuple(kv_offsets.shape)
+        if (
+            len(pool_mapping_shape) != 2
+            or pool_mapping_shape[1] < 2
+            or local_layer_idx >= pool_mapping_shape[0]
+            or len(kv_offsets_shape) != 1
+        ):
+            return None
+        try:
+            pool_mapping_version = pool_mapping._version
+            kv_offsets_version = kv_offsets._version
+        except RuntimeError:
+            # Inference tensors do not expose version counters. Resolve them
+            # for this call, but never retain a binding or publish a B1 support
+            # certificate that could outlive the validated scalar reads.
+            pool_mapping_version = None
+            kv_offsets_version = None
+            self._v2_kv_page_offset_binding = None
+
+        binding = self._v2_kv_page_offset_binding
+        if binding is not None and pool_mapping_version is not None:
+            bound_manager = binding.manager_identity.get()
+            # Check the weak manager identity before consulting the impl ID;
+            # this prevents a recycled Python ID from validating a new manager.
+            if bound_manager is manager and (
+                binding.manager_impl_id == id(manager_impl)
+                and binding.pool_mapping is pool_mapping
+                and binding.pool_mapping_shape == pool_mapping_shape
+                and binding.pool_mapping_version == pool_mapping_version
+                and binding.kv_offsets is kv_offsets
+                and binding.kv_offsets_shape == kv_offsets_shape
+                and binding.kv_offsets_version == kv_offsets_version
+                and binding.local_layer_idx == local_layer_idx
+                and binding.pool_index == 0
+            ):
+                return binding
+            self._v2_kv_page_offset_binding = None
+
+        try:
+            manager_identity = _WeakIdentity(manager)
+        except TypeError:
+            # Never retain an estimation or shutdown manager just to cache a
+            # host-side scalar lookup.
+            return None
+
+        try:
+            pool_index = self._read_host_tensor_scalar(pool_mapping, (local_layer_idx, 0))
+        except (IndexError, RuntimeError, TypeError, ValueError):
+            return None
+        if (
+            pool_index < 0
+            or pool_index >= num_pools
+            or pool_index >= kv_offsets_shape[0]
+            or pool_index != 0
+        ):
+            return None
+        try:
+            kv_page_offset = self._read_host_tensor_scalar(kv_offsets, pool_index)
+        except (IndexError, RuntimeError, TypeError, ValueError):
+            return None
+        if kv_page_offset <= 0:
+            return None
+        if pool_mapping_version is not None:
+            try:
+                versions_changed = (
+                    pool_mapping._version != pool_mapping_version
+                    or kv_offsets._version != kv_offsets_version
+                )
+            except RuntimeError:
+                return None
+            if versions_changed:
+                return None
+        elif (
+            meta.kv_cache_manager is not manager
+            or getattr(manager, "impl", None) is not manager_impl
+            or meta.host_kv_cache_pool_mapping is not pool_mapping
+            or getattr(manager, "kv_offset", None) is not kv_offsets
+            or tuple(pool_mapping.shape) != pool_mapping_shape
+            or tuple(kv_offsets.shape) != kv_offsets_shape
+        ):
+            return None
+
+        # Cached engine-owned tensors are mutated only through PyTorch, so
+        # identity, version, and shape cover supported mutation. A versionless
+        # binding is returned only to its caller and is never retained.
+        binding = _V2KvPageOffsetBinding(
+            manager_identity=manager_identity,
+            manager_impl_id=id(manager_impl),
+            pool_mapping=pool_mapping,
+            pool_mapping_shape=pool_mapping_shape,
+            pool_mapping_version=pool_mapping_version,
+            kv_offsets=kv_offsets,
+            kv_offsets_shape=kv_offsets_shape,
+            kv_offsets_version=kv_offsets_version,
+            local_layer_idx=local_layer_idx,
+            pool_index=pool_index,
+            kv_page_offset=kv_page_offset,
+        )
+        if pool_mapping_version is not None:
+            self._v2_kv_page_offset_binding = binding
+        return binding
+
+    @staticmethod
+    def _read_host_tensor_scalar(tensor: torch.Tensor, index: object) -> int:
+        return int(tensor[index])
+
     def _get_kv_page_offset(
         self,
         attn: "TrtllmAttention",
@@ -485,6 +972,16 @@ class PrimsTSFmha(PhasedFmha):
     ) -> Optional[int]:
         """Return the V-page displacement relative to a K page ID."""
         manager = meta.kv_cache_manager
+        manager_impl = getattr(manager, "impl", None)
+        if callable(getattr(manager_impl, "get_page_index_upper_bound", None)):
+            num_pools = getattr(manager, "num_pools", None)
+            if num_pools == 1:
+                binding = self._get_v2_kv_page_offset_binding(attn, meta)
+                return None if binding is None else binding.kv_page_offset
+            if not isinstance(num_pools, int) or num_pools <= 1:
+                return None
+
+        # V1 and V2 multi-pool requests retain the original per-pool fallback.
         local_layer_idx = getattr(attn, "local_layer_idx", None)
         if local_layer_idx is None:
             get_local_layer_idx = getattr(attn, "get_local_layer_idx", None)
@@ -714,8 +1211,11 @@ class PrimsTSFmha(PhasedFmha):
         page_size: int,
         max_kv_len: int,
         window_left: int,
+        cache_dense_page_alias: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build the live native context metadata entirely on the current stream."""
+        if not cache_dense_page_alias:
+            self._dense_context_page_alias = None
         if block_tables.ndim != 3 or block_tables.shape[1] != 2:
             raise RuntimeError(
                 "PrimTS expects block tables with shape [batch, 2, max_blocks], got "
@@ -749,8 +1249,16 @@ class PrimsTSFmha(PhasedFmha):
         ):
             raise RuntimeError("PrimTS context metadata storage was not prepared.")
 
-        logical_kv_indptr = cu_kv_seqlens[: batch_size + 1]
-        seq_lens_kv = sequence_lengths[:batch_size]
+        logical_kv_indptr = (
+            cu_kv_seqlens
+            if cu_kv_seqlens.ndim == 1 and cu_kv_seqlens.shape[0] == batch_size + 1
+            else cu_kv_seqlens[: batch_size + 1]
+        )
+        seq_lens_kv = (
+            sequence_lengths
+            if sequence_lengths.ndim == 1 and sequence_lengths.shape[0] == batch_size
+            else sequence_lengths[:batch_size]
+        )
         padded_pages = required_padded_pages
         if (
             batch_size == 1
@@ -758,11 +1266,36 @@ class PrimsTSFmha(PhasedFmha):
             and window_left < 0
             and active_pages == padded_pages
         ):
-            source_pages = block_tables[:1, 0:1, :active_pages]
-            source_capacity = (
-                source_pages.untyped_storage().nbytes() // source_pages.element_size()
-                - source_pages.storage_offset()
+            source_storage_capacity = (
+                block_tables.untyped_storage().nbytes() // block_tables.element_size()
             )
+            source_key: Optional[tuple[object, ...]] = None
+            if cache_dense_page_alias:
+                source_key = (
+                    block_tables.device,
+                    block_tables.dtype,
+                    block_tables.data_ptr(),
+                    tuple(block_tables.shape),
+                    tuple(block_tables.stride()),
+                    block_tables.storage_offset(),
+                    source_storage_capacity,
+                    page_size,
+                    padded_pages,
+                    batch_size,
+                    int(self.attn.head_dim),
+                    window_left,
+                    active_pages,
+                    max_kv_len,
+                )
+                cached_alias = self._dense_context_page_alias
+                if cached_alias is not None and cached_alias.source_key == source_key:
+                    return (
+                        logical_kv_indptr,
+                        seq_lens_kv,
+                        cached_alias.dense_page_idx_kv,
+                    )
+            source_pages = block_tables[:1, 0:1, :active_pages]
+            source_capacity = source_storage_capacity - source_pages.storage_offset()
             if (
                 source_pages.is_contiguous()
                 and source_pages.data_ptr() % 16 == 0
@@ -771,13 +1304,20 @@ class PrimsTSFmha(PhasedFmha):
                 # Paired D128 reads only plane 0 and uses separately shifted K/V
                 # pools. Plane 1 of this compact alias is therefore intentionally
                 # unspecified; D256 reads both planes and must keep using the copy.
+                dense_page_idx_kv = source_pages.as_strided(
+                    (1, 2, padded_pages),
+                    (2 * padded_pages, padded_pages, 1),
+                )
+                if source_key is not None:
+                    self._dense_context_page_alias = _DenseContextPageAlias(
+                        source=block_tables,
+                        source_key=source_key,
+                        dense_page_idx_kv=dense_page_idx_kv,
+                    )
                 return (
                     logical_kv_indptr,
                     seq_lens_kv,
-                    source_pages.as_strided(
-                        (1, 2, padded_pages),
-                        (2 * padded_pages, padded_pages, 1),
-                    ),
+                    dense_page_idx_kv,
                 )
 
         dense_page_idx_kv = self._context_page_indices_buffer.view(-1)[
@@ -1305,6 +1845,11 @@ class PrimsTSFmha(PhasedFmha):
             page_size=params.tokens_per_block,
             max_kv_len=max_seq_len_k,
             window_left=int(window_left),
+            cache_dense_page_alias=not getattr(
+                meta.kv_cache_manager,
+                "is_estimating_kv_cache",
+                False,
+            ),
         )
         mask_type = self._get_prims_mask_type(fwd)
         wrapper = self._get_or_plan_context_wrapper(

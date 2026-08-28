@@ -191,6 +191,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         repr=False,
     )
 
+    # Positive request-scoped certificate for homogeneous dense PrimTS
+    # context layers. It is cleared by prepare() before every forward step.
+    _prims_ts_b1_context_support_key: Optional[Tuple[object, ...]] = field(
+        default=None, init=False, repr=False, compare=False)
+
     use_paged_context_fmha: bool = field(init=False, default=False, repr=False)
 
     # FMHA prologue buffers for the MLA generation path, hoisted out of the per-layer
@@ -678,6 +683,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return None
 
     def prepare(self) -> None:
+        self._prims_ts_b1_context_support_key = None
         super().prepare()
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
         self._invalidate_mla_scheduler_buffers()
@@ -809,6 +815,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             context_kv_tokens: int, generation_kv_tokens: int,
             max_kv_len: int) -> None:
         """Prepare encoder-decoder attention from precomputed lengths."""
+        self._prims_ts_b1_context_support_key = None
         super().prepare()
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is None:
@@ -856,6 +863,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def prepare_encoder_only(self) -> None:
         """Fast path for encoder-only forward (eager + CUDA graph capture)."""
+        self._prims_ts_b1_context_support_key = None
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is None:
             get_global_attrs().attention_metadata = weakref.ref(self)
