@@ -334,13 +334,6 @@ class PrimsTSFmha(PhasedFmha):
             return super().forward(q, k, v, metadata, forward_args)
 
         workspace = cast(torch.Tensor, metadata.effective_workspace)
-        fp8_context_fmha = self.get_fp8_context_fmha(
-            q,
-            output,
-            metadata,
-            forward_args,
-            False,
-        )
         self.prepare_workspace(
             q,
             k,
@@ -377,7 +370,6 @@ class PrimsTSFmha(PhasedFmha):
             max_attention_window_size=max_attention_window_size,
             cyclic_attention_window_size=attention_window_size,
             tokens_per_block=tokens_per_block,
-            fp8_context_fmha=fp8_context_fmha,
             kv_factor=self.kv_factor,
             total_num_blocks=self._get_total_num_blocks(metadata),
             is_cross=metadata.is_cross,
@@ -467,7 +459,7 @@ class PrimsTSFmha(PhasedFmha):
         ):
             return None
 
-        sparse_prediction = fwd.sparse_prediction
+        sparse_prediction = getattr(fwd, "sparse_prediction", None)
         if (
             attn.sparse_params is not None
             or meta.num_sparse_topk > 0

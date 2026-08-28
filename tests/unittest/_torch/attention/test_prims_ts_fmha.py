@@ -370,10 +370,6 @@ def _capture_b1_forward_params(
     events: list[str] = []
     captured: list[FmhaParams] = []
 
-    def get_fp8(*args: object, **kwargs: object) -> bool:
-        events.append("fp8")
-        return False
-
     def prepare(*args: object, **kwargs: object) -> None:
         events.append("prepare")
 
@@ -385,7 +381,6 @@ def _capture_b1_forward_params(
         events.append("run")
         captured.append(params)
 
-    monkeypatch.setattr(fmha, "get_fp8_context_fmha", get_fp8)
     monkeypatch.setattr(fmha, "prepare_workspace", prepare)
     monkeypatch.setattr(fmha, "_get_total_num_blocks", get_total_blocks)
     monkeypatch.setattr(fmha, "run_context", run)
@@ -551,7 +546,7 @@ def test_b1_forward_fast_path_matches_generic_params_and_order(
         generic=False,
     )
 
-    assert generic_events == ["fp8", "prepare", "blocks", "run"]
+    assert generic_events == ["prepare", "blocks", "run"]
     assert fast_events == generic_events
     identity_fields = {"attn", "meta", "fwd", "workspace"}
     for params_field in fields(FmhaParams):
@@ -589,7 +584,6 @@ def test_b1_forward_fast_path_reads_live_runtime_views_and_prefix_lengths(
         kv_length=105,
     )
     captured: list[FmhaParams] = []
-    monkeypatch.setattr(fmha, "get_fp8_context_fmha", Mock(return_value=False))
     monkeypatch.setattr(fmha, "prepare_workspace", Mock())
     monkeypatch.setattr(fmha, "_get_total_num_blocks", Mock(return_value=96))
     monkeypatch.setattr(fmha, "run_context", captured.append)
@@ -656,7 +650,6 @@ def test_b1_forward_fast_path_rereads_views_after_prepare(
         metadata.prompt_lens_cpu_runtime = replacement_prompt_cpu
 
     run_context = Mock()
-    monkeypatch.setattr(fmha, "get_fp8_context_fmha", Mock(return_value=False))
     monkeypatch.setattr(fmha, "prepare_workspace", prepare)
     monkeypatch.setattr(fmha, "_get_total_num_blocks", Mock(return_value=96))
     monkeypatch.setattr(fmha, "run_context", run_context)
@@ -754,7 +747,6 @@ def test_b1_forward_fast_path_propagates_prepare_failure_before_run(
     def run_context(params: FmhaParams) -> None:
         events.append("run")
 
-    monkeypatch.setattr(fmha, "get_fp8_context_fmha", Mock(return_value=False))
     monkeypatch.setattr(fmha, "prepare_workspace", prepare)
     monkeypatch.setattr(fmha, "run_context", run_context)
 
@@ -869,6 +861,7 @@ def test_is_supported_accepts_and_forwards_phase_keyword(
     attn = _Attention()
     fmha = PrimsTSFmha(attn)
     support_check = Mock(return_value=(True, ""))
+    monkeypatch.setattr(fmha, "_get_b1_context_support_key", Mock(return_value=None))
     monkeypatch.setattr(fmha, "_is_supported_with_reason", support_check)
     q = Mock(spec=torch.Tensor)
     metadata = SimpleNamespace()
