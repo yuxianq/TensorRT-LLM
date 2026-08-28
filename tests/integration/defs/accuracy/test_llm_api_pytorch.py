@@ -1614,7 +1614,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
         calls = _count_prims_ts_phase_calls(mocker)
         env = {
-            "TLLM_FMHA_LIBS": "prims_ts,fallback",
+            "TLLM_FMHA_LIBS": "+prims_ts",
             "TLLM_WORKER_USE_SINGLE_PROCESS": "1",
         }
         kv_cache_config = KvCacheConfig(
@@ -4491,9 +4491,9 @@ class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
 
         calls = _count_prims_ts_phase_calls(mocker)
         env = {
-            # An empty override selects the default registry. This exercises
-            # PrimsTS precedence over the other dense Blackwell libraries.
-            "TLLM_FMHA_LIBS": "",
+            # Add PrimTS to the defaults; canonical ordering selects it before
+            # the other dense Blackwell libraries.
+            "TLLM_FMHA_LIBS": "+prims_ts",
             "TLLM_WORKER_USE_SINGLE_PROCESS": "1",
         }
         kv_cache_config = KvCacheConfig(

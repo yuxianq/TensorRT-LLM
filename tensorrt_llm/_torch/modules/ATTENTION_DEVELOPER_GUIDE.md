@@ -256,11 +256,13 @@ the `TRTLLM` backend, and `FallbackFmha` calls the regular `thop.attention`
 runtime path. These are not separate attention backends.
 
 `TLLM_FMHA_LIBS` controls the ordered list. Unset means
-`msa_sparse_gqa,prims_ts,cute_dsl_mla,flashinfer_trtllm_gen,fallback`; use
-`TLLM_FMHA_LIBS=fallback` or
-`TLLM_FMHA_LIBS=-msa_sparse_gqa,-prims_ts,-cute_dsl_mla,-flashinfer_trtllm_gen`
-to force the fallback path. PrimsTS precedes the other dense Blackwell libraries,
-so every request admitted by its request-level support check dispatches to it.
+`msa_sparse_gqa,cute_dsl_mla,flashinfer_trtllm_gen,fallback`; PrimTS is opt-in
+because it may add host overhead. Use `TLLM_FMHA_LIBS=+prims_ts` to add it to
+the defaults or `TLLM_FMHA_LIBS=fallback` to force the fallback path. Delta
+entries update membership and then use the canonical registry order, while an
+exact list preserves the user-specified order. PrimTS is first in the canonical
+order, so every request admitted by its request-level support check dispatches
+to it when enabled.
 Each FMHA library exposes `is_available()` for module/static environment checks
 and `is_supported()` for per-forward request checks.
 

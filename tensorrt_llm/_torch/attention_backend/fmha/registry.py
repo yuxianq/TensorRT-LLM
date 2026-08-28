@@ -34,8 +34,8 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
     from .msa_sparse_gqa import MsaSparseGqaFmha
 
     return {
-        "msa_sparse_gqa": MsaSparseGqaFmha,
         "prims_ts": PrimsTSFmha,
+        "msa_sparse_gqa": MsaSparseGqaFmha,
         "cute_dsl_mla": CuteDslMlaFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
         "fallback": FallbackFmha,
@@ -43,7 +43,7 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
 
 
 FMHA_LIBS: dict[str, FmhaCls] = init_fmha_libs()
-DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(FMHA_LIBS)
+DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(name for name in FMHA_LIBS if name != "prims_ts")
 
 
 def _parse_fmha_libs_env() -> tuple[str, ...]:
@@ -63,7 +63,7 @@ def _parse_fmha_libs_env() -> tuple[str, ...]:
         )
 
     if has_delta_token:
-        names = list(DEFAULT_FMHA_LIBS)
+        enabled_names = set(DEFAULT_FMHA_LIBS)
         for token in tokens:
             sign = token[0]
             name = token[1:].strip()
@@ -71,10 +71,11 @@ def _parse_fmha_libs_env() -> tuple[str, ...]:
                 raise ValueError(f"Invalid empty FMHA library entry in {value!r}.")
             if name not in FMHA_LIBS:
                 raise ValueError(f"Unknown FMHA library {name!r} in TLLM_FMHA_LIBS.")
-            if sign == "+" and name not in names:
-                names.append(name)
-            elif sign == "-" and name in names:
-                names.remove(name)
+            if sign == "+":
+                enabled_names.add(name)
+            else:
+                enabled_names.discard(name)
+        names = [name for name in FMHA_LIBS if name in enabled_names]
     else:
         names = []
         for name in tokens:
