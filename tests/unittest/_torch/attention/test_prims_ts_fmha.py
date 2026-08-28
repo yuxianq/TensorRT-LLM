@@ -14,9 +14,11 @@
 # limitations under the License.
 
 import ast
+import gc
 import inspect
 import math
-from dataclasses import replace
+import weakref
+from dataclasses import fields, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -27,15 +29,21 @@ from packaging.version import Version
 
 import tensorrt_llm._torch.attention_backend.fmha.prims_ts as prims_ts_module
 from tensorrt_llm._torch.attention_backend.fmha.fallback import FallbackFmha
-from tensorrt_llm._torch.attention_backend.fmha.phased import FmhaParams
+from tensorrt_llm._torch.attention_backend.fmha.phased import FmhaParams, PhasedFmha
 from tensorrt_llm._torch.attention_backend.fmha.prims_ts import PrimsTSFmha
 from tensorrt_llm._torch.attention_backend.fmha.registry import get_enabled_fmha_lib_classes
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionForwardArgs,
     AttentionInputType,
+    AttentionMetadata,
     PredefinedAttentionMask,
 )
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm.bindings import DataType
+
+
+class _WeakManager(SimpleNamespace):
+    """Simple weak-referenceable stand-in for KVCacheManager."""
 
 
 class _TensorSpec:
@@ -60,6 +68,9 @@ class _TensorSpec:
 
     def numel(self) -> int:
         return math.prod(self.shape)
+
+    def data_ptr(self) -> int:
+        return id(self)
 
 
 class _Attention:
@@ -219,6 +230,566 @@ def _support_result(
     k = _TensorSpec((4, attn.num_kv_heads * head_dim), dtype) if has_separate_kv else None
     v = _TensorSpec((4, attn.num_kv_heads * head_dim), dtype) if has_separate_kv else None
     return fmha._is_supported_with_reason(q, k, v, attn, metadata, forward_args)
+
+
+def _make_b1_context_cache_inputs(
+    *,
+    local_layer_idx: int = 0,
+    head_dim: int = 128,
+) -> tuple[
+    PrimsTSFmha,
+    _TensorSpec,
+    SimpleNamespace,
+    AttentionForwardArgs,
+]:
+    attn = _Attention(head_dim=head_dim)
+    attn.local_layer_idx = local_layer_idx
+    fmha = PrimsTSFmha(attn)
+    num_tokens = 4
+    q = _TensorSpec(
+        (num_tokens, (attn.num_heads + 2 * attn.num_kv_heads) * head_dim),
+        torch.bfloat16,
+    )
+    output = _TensorSpec(
+        (num_tokens, attn.num_heads * head_dim),
+        torch.bfloat16,
+    )
+    manager = _WeakManager(
+        dtype=DataType.BF16,
+        impl=SimpleNamespace(get_page_index_upper_bound=lambda *args: 128),
+        enable_swa_scratch_reuse=False,
+        num_pools=1,
+        kv_offset=torch.tensor([64], dtype=torch.int32),
+    )
+    metadata = SimpleNamespace(
+        _attention_owner=attn,
+        _prims_ts_b1_context_support_key=None,
+        is_cuda_graph=False,
+        is_cross=False,
+        kv_cache_manager=manager,
+        kv_cache_block_offsets=torch.empty(1),
+        host_kv_cache_pool_pointers=torch.tensor([1234], dtype=torch.int64),
+        host_kv_cache_pool_mapping=torch.tensor([[0, 0], [0, 1]], dtype=torch.int32),
+        kv_layout="HND",
+        beam_width=1,
+        is_spec_decoding_enabled=False,
+        use_spec_decoding=False,
+        is_spec_dec_tree=False,
+        is_spec_dec_dynamic_tree=False,
+        runtime_features=SimpleNamespace(
+            chunked_prefill=False,
+            cache_reuse=False,
+            has_speculative_draft_tokens=False,
+        ),
+        num_sparse_topk=0,
+        helix_position_offsets=None,
+        num_contexts=1,
+        num_generations=0,
+        num_ctx_tokens=num_tokens,
+        tokens_per_block=32,
+        max_seq_len=128,
+        kv_lens_runtime=torch.tensor([num_tokens], dtype=torch.int32),
+    )
+    forward_args = AttentionForwardArgs(
+        output=output,
+        attention_input_type=AttentionInputType.mixed,
+        attention_mask=PredefinedAttentionMask.CAUSAL,
+        attention_window_size=128,
+        is_fused_qkv=True,
+    )
+    return fmha, q, metadata, forward_args
+
+
+def _make_b1_forward_inputs(
+    *,
+    attention_input_type: AttentionInputType = AttentionInputType.context_only,
+    num_ctx_tokens: int = 4,
+    prompt_length: int = 4,
+    kv_length: int = 4,
+) -> tuple[
+    PrimsTSFmha,
+    torch.Tensor,
+    SimpleNamespace,
+    AttentionForwardArgs,
+]:
+    attn = _Attention()
+    fmha = PrimsTSFmha(attn)
+    q = torch.zeros(
+        (num_ctx_tokens, (attn.num_heads + 2 * attn.num_kv_heads) * attn.head_dim),
+        dtype=torch.bfloat16,
+    )
+    output = torch.zeros(
+        (num_ctx_tokens, attn.num_heads * attn.head_dim),
+        dtype=torch.bfloat16,
+    )
+    metadata = SimpleNamespace(
+        _attention_owner=attn,
+        effective_workspace=torch.empty(16, dtype=torch.uint8),
+        kv_cache_block_offsets=torch.empty((1, 1, 2, 4), dtype=torch.int32),
+        cache_indirection=None,
+        beam_width=1,
+        num_contexts=1,
+        num_generations=0,
+        num_ctx_tokens=num_ctx_tokens,
+        tokens_per_block=32,
+        is_cross=False,
+        kv_lens_cuda_runtime=torch.tensor([kv_length], dtype=torch.int32),
+        kv_lens_runtime=torch.tensor([kv_length], dtype=torch.int32),
+        prompt_lens_cuda_runtime=torch.tensor([prompt_length], dtype=torch.int32),
+        prompt_lens_cpu_runtime=torch.tensor([prompt_length], dtype=torch.int32),
+    )
+    forward_args = AttentionForwardArgs(
+        output=output,
+        attention_input_type=attention_input_type,
+        attention_mask=PredefinedAttentionMask.CAUSAL,
+        attention_window_size=128,
+        is_fused_qkv=True,
+    )
+    return fmha, q, metadata, forward_args
+
+
+def _capture_b1_forward_params(
+    monkeypatch: pytest.MonkeyPatch,
+    fmha: PrimsTSFmha,
+    q: torch.Tensor,
+    metadata: SimpleNamespace,
+    forward_args: AttentionForwardArgs,
+    *,
+    generic: bool,
+) -> tuple[FmhaParams, list[str]]:
+    events: list[str] = []
+    captured: list[FmhaParams] = []
+
+    def get_fp8(*args: object, **kwargs: object) -> bool:
+        events.append("fp8")
+        return False
+
+    def prepare(*args: object, **kwargs: object) -> None:
+        events.append("prepare")
+
+    def get_total_blocks(*args: object, **kwargs: object) -> int:
+        events.append("blocks")
+        return 96
+
+    def run(params: FmhaParams) -> None:
+        events.append("run")
+        captured.append(params)
+
+    monkeypatch.setattr(fmha, "get_fp8_context_fmha", get_fp8)
+    monkeypatch.setattr(fmha, "prepare_workspace", prepare)
+    monkeypatch.setattr(fmha, "_get_total_num_blocks", get_total_blocks)
+    monkeypatch.setattr(fmha, "run_context", run)
+    if generic:
+        PhasedFmha.forward(fmha, q, None, None, metadata, forward_args)
+    else:
+        fmha.forward(q, None, None, metadata, forward_args)
+
+    assert len(captured) == 1
+    return captured[0], events
+
+
+def test_b1_context_support_cache_reuses_first_layer_positive_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    first, first_q, metadata, first_args = _make_b1_context_cache_inputs()
+    second, second_q, _, second_args = _make_b1_context_cache_inputs(local_layer_idx=1)
+    second_args.output = _TensorSpec(first_args.output.shape, first_args.output.dtype)
+    first_full_check = Mock(wraps=first._is_supported_with_reason)
+    second_full_check = Mock(wraps=second._is_supported_with_reason)
+    monkeypatch.setattr(first, "_is_supported_with_reason", first_full_check)
+    monkeypatch.setattr(second, "_is_supported_with_reason", second_full_check)
+
+    assert first.is_supported(first_q, None, None, metadata, first_args)
+    support_key = metadata._prims_ts_b1_context_support_key
+    assert support_key == first._get_b1_context_support_key(
+        first_q, None, None, first.attn, metadata, first_args
+    )
+    assert first_full_check.call_count == 1
+
+    assert second_q.data_ptr() != first_q.data_ptr()
+    assert second_args.output.data_ptr() != first_args.output.data_ptr()
+    assert second.is_supported(second_q, None, None, metadata, second_args)
+    assert second_full_check.call_count == 0
+    assert metadata._prims_ts_b1_context_support_key is support_key
+
+
+def test_ungrouped_support_cache_live_capture_runs_full_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capturing = False
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    fmha, q, metadata, forward_args = _make_b1_context_cache_inputs()
+    full_check = Mock(wraps=fmha._is_supported_with_reason)
+    monkeypatch.setattr(fmha, "_is_supported_with_reason", full_check)
+
+    assert fmha.is_supported(q, None, None, metadata, forward_args)
+    assert metadata._prims_ts_b1_context_support_key is not None
+    assert full_check.call_count == 1
+
+    capturing = True
+    assert not fmha.is_supported(q, None, None, metadata, forward_args)
+    assert full_check.call_count == 2
+
+
+def test_b1_context_support_cache_mismatch_runs_full_check_without_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    first, first_q, metadata, first_args = _make_b1_context_cache_inputs()
+    assert first.is_supported(first_q, None, None, metadata, first_args)
+    support_key = metadata._prims_ts_b1_context_support_key
+
+    different, different_q, _, different_args = _make_b1_context_cache_inputs(
+        local_layer_idx=1, head_dim=256
+    )
+    different_full_check = Mock(wraps=different._is_supported_with_reason)
+    monkeypatch.setattr(different, "_is_supported_with_reason", different_full_check)
+
+    assert different.is_supported(different_q, None, None, metadata, different_args)
+    assert different_full_check.call_count == 1
+    assert metadata._prims_ts_b1_context_support_key is support_key
+
+
+def test_b1_context_support_cache_does_not_store_unsupported_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    fmha, q, metadata, forward_args = _make_b1_context_cache_inputs(head_dim=64)
+    full_check = Mock(wraps=fmha._is_supported_with_reason)
+    monkeypatch.setattr(fmha, "_is_supported_with_reason", full_check)
+
+    assert not fmha.is_supported(q, None, None, metadata, forward_args)
+    assert full_check.call_count == 1
+    assert metadata._prims_ts_b1_context_support_key is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["cuda-graph", "speculative", "cross", "v1", "multi-pool", "sparse"],
+)
+def test_b1_context_support_cache_bypasses_non_exact_requests(case: str) -> None:
+    fmha, q, metadata, forward_args = _make_b1_context_cache_inputs()
+    if case == "cuda-graph":
+        metadata.is_cuda_graph = True
+    elif case == "speculative":
+        metadata.use_spec_decoding = True
+    elif case == "cross":
+        metadata.is_cross = True
+    elif case == "v1":
+        metadata.kv_cache_manager.impl = SimpleNamespace()
+    elif case == "multi-pool":
+        metadata.kv_cache_manager.num_pools = 2
+    else:
+        fmha.attn.sparse_params = SimpleNamespace(algorithm="mqa_gqa")
+
+    assert (
+        fmha._get_b1_context_support_key(q, None, None, fmha.attn, metadata, forward_args) is None
+    )
+
+
+def test_b1_context_support_cache_is_request_scoped_and_non_comparing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = object.__new__(TrtllmAttentionMetadata)
+    metadata._prims_ts_b1_context_support_key = ("positive",)
+    prepare_error = RuntimeError("stop after request cache reset")
+    monkeypatch.setattr(
+        AttentionMetadata,
+        "prepare",
+        Mock(side_effect=prepare_error),
+    )
+
+    with pytest.raises(RuntimeError, match="stop after request cache reset"):
+        metadata.prepare()
+    assert metadata._prims_ts_b1_context_support_key is None
+    cache_field = TrtllmAttentionMetadata.__dataclass_fields__["_prims_ts_b1_context_support_key"]
+    assert not cache_field.init
+    assert not cache_field.repr
+    assert not cache_field.compare
+
+
+@pytest.mark.parametrize(
+    "attention_input_type",
+    [AttentionInputType.context_only, AttentionInputType.mixed],
+    ids=["context-only", "mixed-without-generation"],
+)
+def test_b1_forward_fast_path_matches_generic_params_and_order(
+    monkeypatch: pytest.MonkeyPatch,
+    attention_input_type: AttentionInputType,
+) -> None:
+    fmha, q, metadata, forward_args = _make_b1_forward_inputs(
+        attention_input_type=attention_input_type,
+        num_ctx_tokens=4,
+        prompt_length=3,
+        kv_length=105,
+    )
+    generic_params, generic_events = _capture_b1_forward_params(
+        monkeypatch,
+        fmha,
+        q,
+        metadata,
+        forward_args,
+        generic=True,
+    )
+    fast_params, fast_events = _capture_b1_forward_params(
+        monkeypatch,
+        fmha,
+        q,
+        metadata,
+        forward_args,
+        generic=False,
+    )
+
+    assert generic_events == ["fp8", "prepare", "blocks", "run"]
+    assert fast_events == generic_events
+    identity_fields = {"attn", "meta", "fwd", "workspace"}
+    for params_field in fields(FmhaParams):
+        generic_value = getattr(generic_params, params_field.name)
+        fast_value = getattr(fast_params, params_field.name)
+        if params_field.name in identity_fields:
+            assert fast_value is generic_value
+        elif isinstance(generic_value, torch.Tensor):
+            assert isinstance(fast_value, torch.Tensor)
+            torch.testing.assert_close(fast_value, generic_value)
+            assert fast_value.shape == generic_value.shape
+            assert fast_value.stride() == generic_value.stride()
+            assert fast_value.storage_offset() == generic_value.storage_offset()
+        else:
+            assert fast_value == generic_value
+
+    assert fast_params.attention_input is q
+    assert fast_params.qkv_input is q
+    assert fast_params.sequence_lengths is metadata.kv_lens_cuda_runtime
+    assert fast_params.context_lengths is metadata.prompt_lens_cuda_runtime
+    assert fast_params.context_buf is not None
+    assert fast_params.context_buf.data_ptr() == forward_args.output.data_ptr()
+    assert fast_params.context_buf.shape == (4, fmha.attn.num_heads, fmha.attn.head_dim)
+    assert generic_params.attention_input is not q
+    assert generic_params.sequence_lengths is not metadata.kv_lens_cuda_runtime
+    assert generic_params.context_lengths is not metadata.prompt_lens_cuda_runtime
+
+
+def test_b1_forward_fast_path_reads_live_runtime_views_and_prefix_lengths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fmha, q, metadata, forward_args = _make_b1_forward_inputs(
+        num_ctx_tokens=4,
+        prompt_length=3,
+        kv_length=105,
+    )
+    captured: list[FmhaParams] = []
+    monkeypatch.setattr(fmha, "get_fp8_context_fmha", Mock(return_value=False))
+    monkeypatch.setattr(fmha, "prepare_workspace", Mock())
+    monkeypatch.setattr(fmha, "_get_total_num_blocks", Mock(return_value=96))
+    monkeypatch.setattr(fmha, "run_context", captured.append)
+
+    fmha.forward(q, None, None, metadata, forward_args)
+    first = captured[-1]
+    assert first.num_tokens == 4
+    assert first.input_seq_length == 3
+    assert first.max_past_kv_length == 105
+
+    q.fill_(7)
+    metadata.kv_lens_cuda_runtime.fill_(106)
+    metadata.prompt_lens_cuda_runtime.fill_(2)
+    metadata.kv_lens_runtime.fill_(107)
+    metadata.prompt_lens_cpu_runtime.fill_(2)
+    assert first.attention_input is not None
+    assert torch.count_nonzero(first.attention_input != 7) == 0
+    torch.testing.assert_close(first.sequence_lengths, torch.tensor([106], dtype=torch.int32))
+    torch.testing.assert_close(first.context_lengths, torch.tensor([2], dtype=torch.int32))
+    assert first.input_seq_length == 3
+    assert first.max_past_kv_length == 105
+
+    fmha.forward(q, None, None, metadata, forward_args)
+    second = captured[-1]
+    assert second.input_seq_length == 2
+    assert second.max_past_kv_length == 107
+
+
+def test_b1_forward_fast_path_rereads_views_after_prepare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fmha, q, metadata, forward_args = _make_b1_forward_inputs()
+    replacement_kv_cuda = torch.tensor([109], dtype=torch.int32)
+    replacement_kv_cpu = torch.tensor([109], dtype=torch.int32)
+    replacement_prompt_cuda = torch.tensor([3], dtype=torch.int32)
+    replacement_prompt_cpu = torch.tensor([3], dtype=torch.int32)
+    scalar_reads: list[str] = []
+
+    class _ScalarReadTensor(torch.Tensor):
+        label: str
+
+        @staticmethod
+        def __new__(cls, tensor: torch.Tensor, label: str) -> "_ScalarReadTensor":
+            result = torch.Tensor._make_subclass(cls, tensor, tensor.requires_grad)
+            result.label = label
+            return result
+
+        def __getitem__(self, index: object) -> "_ScalarReadTensor":
+            result = super().__getitem__(index)
+            result.label = self.label
+            return result
+
+        def __int__(self) -> int:
+            scalar_reads.append(self.label)
+            return super().__int__()
+
+    replacement_kv_cpu = _ScalarReadTensor(replacement_kv_cpu, "kv")
+    replacement_prompt_cpu = _ScalarReadTensor(replacement_prompt_cpu, "prompt")
+
+    def prepare(*args: object, **kwargs: object) -> None:
+        metadata.kv_lens_cuda_runtime = replacement_kv_cuda
+        metadata.kv_lens_runtime = replacement_kv_cpu
+        metadata.prompt_lens_cuda_runtime = replacement_prompt_cuda
+        metadata.prompt_lens_cpu_runtime = replacement_prompt_cpu
+
+    run_context = Mock()
+    monkeypatch.setattr(fmha, "get_fp8_context_fmha", Mock(return_value=False))
+    monkeypatch.setattr(fmha, "prepare_workspace", prepare)
+    monkeypatch.setattr(fmha, "_get_total_num_blocks", Mock(return_value=96))
+    monkeypatch.setattr(fmha, "run_context", run_context)
+
+    fmha.forward(q, None, None, metadata, forward_args)
+
+    params = run_context.call_args.args[0]
+    assert params.sequence_lengths is replacement_kv_cuda
+    assert params.context_lengths is replacement_prompt_cuda
+    assert params.input_seq_length == 3
+    assert params.max_past_kv_length == 109
+    assert scalar_reads == ["prompt", "kv"]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "multiple-contexts",
+        "has-generation",
+        "generation-only",
+        "mla",
+        "zero-context-tokens",
+        "q-row-mismatch",
+        "missing-runtime-length",
+    ],
+)
+def test_b1_forward_fast_path_falls_back_for_other_requests(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    fmha, q, metadata, forward_args = _make_b1_forward_inputs()
+    if case == "multiple-contexts":
+        metadata.num_contexts = 2
+    elif case == "has-generation":
+        metadata.num_generations = 1
+    elif case == "generation-only":
+        forward_args.attention_input_type = AttentionInputType.generation_only
+    elif case == "mla":
+        fmha.attn.is_mla_enable = True
+    elif case == "zero-context-tokens":
+        metadata.num_ctx_tokens = 0
+    elif case == "q-row-mismatch":
+        metadata.num_ctx_tokens = q.shape[0] + 1
+    else:
+        del metadata.prompt_lens_cpu_runtime
+    generic_forward = Mock()
+    monkeypatch.setattr(PhasedFmha, "forward", generic_forward)
+
+    fmha.forward(q, None, None, metadata, forward_args)
+
+    generic_forward.assert_called_once_with(q, None, None, metadata, forward_args)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "kv_lens_cuda_runtime",
+        "kv_lens_runtime",
+        "prompt_lens_cuda_runtime",
+        "prompt_lens_cpu_runtime",
+    ],
+)
+@pytest.mark.parametrize("invalid_shape", ["non-1d", "empty", "oversized"])
+def test_b1_forward_fast_path_falls_back_for_invalid_runtime_length_views(
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    invalid_shape: str,
+) -> None:
+    fmha, q, metadata, forward_args = _make_b1_forward_inputs()
+    if invalid_shape == "non-1d":
+        replacement = torch.ones((1, 1), dtype=torch.int32)
+    elif invalid_shape == "empty":
+        replacement = torch.empty(0, dtype=torch.int32)
+    else:
+        replacement = torch.ones(2, dtype=torch.int32)
+    setattr(metadata, field_name, replacement)
+    generic_forward = Mock()
+    monkeypatch.setattr(PhasedFmha, "forward", generic_forward)
+
+    fmha.forward(q, None, None, metadata, forward_args)
+
+    generic_forward.assert_called_once_with(q, None, None, metadata, forward_args)
+
+
+def test_b1_forward_fast_path_propagates_prepare_failure_before_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fmha, q, metadata, forward_args = _make_b1_forward_inputs()
+    events: list[str] = []
+
+    def prepare(*args: object, **kwargs: object) -> None:
+        events.append("prepare")
+        raise RuntimeError("workspace capture guard")
+
+    def run_context(params: FmhaParams) -> None:
+        events.append("run")
+
+    monkeypatch.setattr(fmha, "get_fp8_context_fmha", Mock(return_value=False))
+    monkeypatch.setattr(fmha, "prepare_workspace", prepare)
+    monkeypatch.setattr(fmha, "run_context", run_context)
+
+    with pytest.raises(RuntimeError, match="workspace capture guard"):
+        fmha.forward(q, None, None, metadata, forward_args)
+
+    assert events == ["prepare"]
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("missing-output", "requires output"),
+        ("missing-page-table", "requires paged KV cache"),
+    ],
+)
+@pytest.mark.parametrize("phase", ["b1-context", "generation-fallback"])
+def test_b1_forward_preserves_required_input_checks(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    message: str,
+    phase: str,
+) -> None:
+    fmha, q, metadata, forward_args = _make_b1_forward_inputs()
+    if phase == "generation-fallback":
+        metadata.num_contexts = 0
+        metadata.num_generations = 1
+        forward_args.attention_input_type = AttentionInputType.generation_only
+    if case == "missing-output":
+        forward_args.output = None
+    else:
+        metadata.kv_cache_block_offsets = None
+    generic_calls: list[tuple[object, ...]] = []
+    generic_forward = PhasedFmha.forward
+
+    def record_generic_forward(self: PhasedFmha, *args: object) -> None:
+        generic_calls.append(args)
+        generic_forward(self, *args)
+
+    monkeypatch.setattr(PhasedFmha, "forward", record_generic_forward)
+
+    with pytest.raises(RuntimeError, match=message):
+        fmha.forward(q, None, None, metadata, forward_args)
+
+    assert len(generic_calls) == (1 if phase == "generation-fallback" else 0)
 
 
 @pytest.mark.parametrize(
@@ -629,15 +1200,244 @@ def test_v1_total_page_bound_excludes_slots_before_selected_layer(is_mla: bool) 
     assert fmha._get_total_num_blocks(metadata) == 64 * 4 * kv_factor - 3 * kv_factor
 
 
-def test_kv_page_offset_uses_v2_manager_displacement() -> None:
+def _make_v2_kv_binding_inputs(
+    *,
+    local_layer_idx: int = 0,
+    pool_mapping: torch.Tensor | None = None,
+    kv_offsets: torch.Tensor | None = None,
+) -> tuple[PrimsTSFmha, SimpleNamespace]:
+    if pool_mapping is None:
+        pool_mapping = torch.tensor([[0, 0]], dtype=torch.int32)
+    if kv_offsets is None:
+        kv_offsets = torch.tensor([64], dtype=torch.int32)
     attn = _Attention()
+    attn.local_layer_idx = local_layer_idx
     fmha = PrimsTSFmha(attn)
+    manager = _WeakManager(
+        impl=SimpleNamespace(get_page_index_upper_bound=lambda *args: 128),
+        num_pools=kv_offsets.shape[0],
+        enable_swa_scratch_reuse=False,
+        kv_offset=kv_offsets,
+    )
     metadata = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(kv_offset=torch.tensor([0, 128])),
-        host_kv_cache_pool_mapping=torch.tensor([[1, 0]], dtype=torch.int32),
+        _attention_owner=attn,
+        kv_cache_manager=manager,
+        host_kv_cache_pool_mapping=pool_mapping,
+    )
+    return fmha, metadata
+
+
+def test_kv_page_offset_uses_v2_manager_displacement() -> None:
+    fmha, metadata = _make_v2_kv_binding_inputs(
+        pool_mapping=torch.tensor([[1, 0]], dtype=torch.int32),
+        kv_offsets=torch.tensor([0, 128], dtype=torch.int32),
     )
 
     assert fmha._get_kv_page_offset(fmha.attn, metadata, 0) == 128
+
+
+def test_v2_kv_binding_hit_avoids_tensor_scalar_reads() -> None:
+    fmha, metadata = _make_v2_kv_binding_inputs()
+    scalar_read = Mock(wraps=fmha._read_host_tensor_scalar)
+    fmha._read_host_tensor_scalar = scalar_read
+
+    assert fmha._get_kv_page_offset(fmha.attn, metadata, 0) == 64
+    assert scalar_read.call_count == 2
+    assert fmha._get_kv_page_offset(fmha.attn, metadata, 0) == 64
+    assert scalar_read.call_count == 2
+
+
+def test_v2_kv_binding_is_shared_with_b1_support_key() -> None:
+    fmha, q, metadata, forward_args = _make_b1_context_cache_inputs()
+    scalar_read = Mock(wraps=fmha._read_host_tensor_scalar)
+    fmha._read_host_tensor_scalar = scalar_read
+
+    assert (
+        fmha._get_b1_context_support_key(q, None, None, fmha.attn, metadata, forward_args)
+        is not None
+    )
+    assert scalar_read.call_count == 2
+    assert fmha._get_kv_page_offset(fmha.attn, metadata, 0) == 64
+    assert scalar_read.call_count == 2
+
+
+@pytest.mark.parametrize("replacement", ["manager", "impl"])
+def test_v2_kv_binding_rebinds_after_manager_state_replacement(
+    replacement: str,
+) -> None:
+    fmha, metadata = _make_v2_kv_binding_inputs()
+    scalar_read = Mock(wraps=fmha._read_host_tensor_scalar)
+    fmha._read_host_tensor_scalar = scalar_read
+    manager = metadata.kv_cache_manager
+
+    assert fmha._get_kv_page_offset(fmha.attn, metadata, 0) == 64
+    if replacement == "manager":
+        metadata.kv_cache_manager = _WeakManager(
+            impl=manager.impl,
+            num_pools=manager.num_pools,
+            enable_swa_scratch_reuse=False,
+            kv_offset=manager.kv_offset,
+        )
+    else:
+        manager.impl = SimpleNamespace(get_page_index_upper_bound=lambda *args: 256)
+
+    assert fmha._get_kv_page_offset(fmha.attn, metadata, 0) == 64
+    assert scalar_read.call_count == 4
+
+
+@pytest.mark.parametrize("replacement", ["mapping", "offsets"])
+def test_v2_kv_binding_rebinds_after_tensor_replacement(replacement: str) -> None:
+    fmha, metadata = _make_v2_kv_binding_inputs()
+    scalar_read = Mock(wraps=fmha._read_host_tensor_scalar)
+    fmha._read_host_tensor_scalar = scalar_read
+
+    assert fmha._get_kv_page_offset(fmha.attn, metadata, 0) == 64
+    if replacement == "mapping":
+        metadata.host_kv_cache_pool_mapping = torch.tensor([[0, 1]], dtype=torch.int32)
+        expected = 64
+    else:
+        metadata.kv_cache_manager.kv_offset = torch.tensor([96], dtype=torch.int32)
+        expected = 96
+
+    assert fmha._get_kv_page_offset(fmha.attn, metadata, 0) == expected
+    assert scalar_read.call_count == 4
+
+
+@pytest.mark.parametrize("mutation", ["mapping", "offsets"])
+def test_v2_kv_binding_rebinds_after_inplace_tensor_mutation(mutation: str) -> None:
+    fmha, metadata = _make_v2_kv_binding_inputs()
+    scalar_read = Mock(wraps=fmha._read_host_tensor_scalar)
+    fmha._read_host_tensor_scalar = scalar_read
+
+    assert fmha._get_kv_page_offset(fmha.attn, metadata, 0) == 64
+    if mutation == "mapping":
+        metadata.host_kv_cache_pool_mapping[0, 1] = 1
+        expected = 64
+    else:
+        metadata.kv_cache_manager.kv_offset[0] = 96
+        expected = 96
+
+    assert fmha._get_kv_page_offset(fmha.attn, metadata, 0) == expected
+    assert scalar_read.call_count == 4
+
+
+def test_v2_kv_binding_rebinds_after_local_layer_change() -> None:
+    fmha, metadata = _make_v2_kv_binding_inputs(
+        pool_mapping=torch.tensor([[0, 0], [0, 1]], dtype=torch.int32),
+    )
+    scalar_read = Mock(wraps=fmha._read_host_tensor_scalar)
+    fmha._read_host_tensor_scalar = scalar_read
+
+    assert fmha._get_kv_page_offset(fmha.attn, metadata, 0) == 64
+    fmha.attn.local_layer_idx = 1
+    assert fmha._get_kv_page_offset(fmha.attn, metadata, 0) == 64
+    assert scalar_read.call_count == 4
+
+
+def test_v2_multipool_uses_original_per_pool_fallback() -> None:
+    fmha, metadata = _make_v2_kv_binding_inputs(
+        local_layer_idx=1,
+        pool_mapping=torch.tensor([[0, 0], [1, 0]], dtype=torch.int32),
+        kv_offsets=torch.tensor([64, 192], dtype=torch.int32),
+    )
+
+    assert fmha._get_kv_page_offset(fmha.attn, metadata, 0) == 192
+    assert fmha._v2_kv_page_offset_binding is None
+    assert fmha._kv_page_offset_cache == {(id(metadata.kv_cache_manager), 1): 192}
+
+
+def test_v2_inference_tensors_resolve_fresh_without_binding() -> None:
+    with torch.inference_mode():
+        pool_mapping = torch.tensor([[0, 0]], dtype=torch.int32)
+        kv_offsets = torch.tensor([64], dtype=torch.int32)
+    fmha, metadata = _make_v2_kv_binding_inputs(
+        pool_mapping=pool_mapping,
+        kv_offsets=kv_offsets,
+    )
+    scalar_read = Mock(wraps=fmha._read_host_tensor_scalar)
+    fmha._read_host_tensor_scalar = scalar_read
+
+    assert fmha._get_kv_page_offset(fmha.attn, metadata, 0) == 64
+    assert fmha._v2_kv_page_offset_binding is None
+    assert scalar_read.call_count == 2
+
+    with torch.inference_mode():
+        kv_offsets[0] = 96
+    assert fmha._get_kv_page_offset(fmha.attn, metadata, 0) == 96
+    assert fmha._v2_kv_page_offset_binding is None
+    assert scalar_read.call_count == 4
+
+
+def test_b1_v2_inference_tensors_remain_supported_without_certificate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    fmha, q, metadata, forward_args = _make_b1_context_cache_inputs()
+    with torch.inference_mode():
+        metadata.host_kv_cache_pool_mapping = torch.tensor([[0, 0], [0, 1]], dtype=torch.int32)
+        metadata.kv_cache_manager.kv_offset = torch.tensor([64], dtype=torch.int32)
+    scalar_read = Mock(wraps=fmha._read_host_tensor_scalar)
+    fmha._read_host_tensor_scalar = scalar_read
+
+    assert fmha.is_supported(q, None, None, metadata, forward_args)
+    assert metadata._prims_ts_b1_context_support_key is None
+    assert fmha._v2_kv_page_offset_binding is None
+    assert scalar_read.call_count == 4
+
+    assert fmha.is_supported(q, None, None, metadata, forward_args)
+    assert metadata._prims_ts_b1_context_support_key is None
+    assert fmha._v2_kv_page_offset_binding is None
+    assert scalar_read.call_count == 8
+
+
+@pytest.mark.parametrize("invalid", ["pool", "offset"])
+def test_b1_v2_binding_fails_closed_for_invalid_single_pool(invalid: str) -> None:
+    fmha, q, metadata, forward_args = _make_b1_context_cache_inputs()
+    if invalid == "pool":
+        metadata.host_kv_cache_pool_mapping[0, 0] = 1
+    else:
+        metadata.kv_cache_manager.kv_offset[0] = 0
+
+    assert (
+        fmha._get_b1_context_support_key(q, None, None, fmha.attn, metadata, forward_args) is None
+    )
+
+
+def test_v2_kv_binding_does_not_retain_dead_manager_or_trust_impl_id() -> None:
+    fmha, metadata = _make_v2_kv_binding_inputs()
+    scalar_read = Mock(wraps=fmha._read_host_tensor_scalar)
+    fmha._read_host_tensor_scalar = scalar_read
+    manager = metadata.kv_cache_manager
+    manager_impl = manager.impl
+    manager_ref = weakref.ref(manager)
+
+    assert fmha._get_kv_page_offset(fmha.attn, metadata, 0) == 64
+    metadata.kv_cache_manager = None
+    del manager
+    gc.collect()
+    assert manager_ref() is None
+
+    metadata.kv_cache_manager = _WeakManager(
+        impl=manager_impl,
+        num_pools=1,
+        enable_swa_scratch_reuse=False,
+        kv_offset=fmha._v2_kv_page_offset_binding.kv_offsets,
+    )
+    assert fmha._get_kv_page_offset(fmha.attn, metadata, 0) == 64
+    assert scalar_read.call_count == 4
+    assert fmha._v2_kv_page_offset_binding.manager_identity.get() is metadata.kv_cache_manager
+
+
+def test_v2_kv_binding_fails_closed_for_nonweak_manager() -> None:
+    fmha, metadata = _make_v2_kv_binding_inputs()
+    manager = metadata.kv_cache_manager
+    metadata.kv_cache_manager = SimpleNamespace(**manager.__dict__)
+    scalar_read = Mock(wraps=fmha._read_host_tensor_scalar)
+    fmha._read_host_tensor_scalar = scalar_read
+
+    assert fmha._get_kv_page_offset(fmha.attn, metadata, 0) is None
+    assert scalar_read.call_count == 0
+    assert fmha._v2_kv_page_offset_binding is None
 
 
 def test_kv_page_offset_is_inferred_from_v1_host_tables() -> None:
@@ -656,6 +1456,7 @@ def test_kv_page_offset_is_inferred_from_v1_host_tables() -> None:
     )
 
     assert fmha._get_kv_page_offset(fmha.attn, metadata, 1) == 64
+    assert fmha._kv_page_offset_cache == {(id(metadata.kv_cache_manager), 0): 64}
 
 
 def test_context_metadata_stages_live_lengths_and_padded_pages() -> None:
@@ -692,8 +1493,11 @@ def test_context_metadata_stages_live_lengths_and_padded_pages() -> None:
         page_size=32,
         max_kv_len=64,
         window_left=-1,
+        cache_dense_page_alias=True,
     )
 
+    assert logical_kv_indptr is cu_kv_seqlens
+    assert seq_lens is sequence_lengths
     assert logical_kv_indptr.data_ptr() == cu_kv_seqlens.data_ptr()
     assert seq_lens.data_ptr() == sequence_lengths.data_ptr()
     torch.testing.assert_close(seq_lens, torch.tensor([33, 64], dtype=torch.int32))
@@ -709,6 +1513,107 @@ def test_context_metadata_stages_live_lengths_and_padded_pages() -> None:
             dtype=torch.int32,
         ),
     )
+    cu_kv_seqlens[1] = 34
+    sequence_lengths[0] = 34
+    torch.testing.assert_close(
+        logical_kv_indptr,
+        torch.tensor([0, 34, 97], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        seq_lens,
+        torch.tensor([34, 64], dtype=torch.int32),
+    )
+
+
+def test_context_metadata_batched_mixed_inputs_keep_bounded_views() -> None:
+    block_tables = torch.tensor(
+        [
+            [[10, 11, 12, 13], [110, 111, 112, 113]],
+            [[20, 21, 22, 23], [120, 121, 122, 123]],
+        ],
+        dtype=torch.int32,
+    )
+    cu_kv_seqlens = torch.tensor([0, 33, 97, 777], dtype=torch.int32)
+    sequence_lengths = torch.tensor([33, 64, 777], dtype=torch.int32)
+    attn = _Attention()
+    fmha = PrimsTSFmha(attn)
+    fmha._ensure_metadata_buffers(
+        torch.device("cpu"),
+        2,
+        4,
+        32,
+        need_context=True,
+    )
+
+    logical_kv_indptr, seq_lens_kv, _ = fmha._stage_context_metadata(
+        block_tables,
+        cu_kv_seqlens,
+        sequence_lengths,
+        batch_size=2,
+        page_size=32,
+        max_kv_len=64,
+        window_left=-1,
+        cache_dense_page_alias=True,
+    )
+
+    assert logical_kv_indptr is not cu_kv_seqlens
+    assert seq_lens_kv is not sequence_lengths
+    assert logical_kv_indptr.shape == (3,)
+    assert seq_lens_kv.shape == (2,)
+    assert logical_kv_indptr.data_ptr() == cu_kv_seqlens.data_ptr()
+    assert seq_lens_kv.data_ptr() == sequence_lengths.data_ptr()
+    torch.testing.assert_close(
+        logical_kv_indptr,
+        torch.tensor([0, 33, 97], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        seq_lens_kv,
+        torch.tensor([33, 64], dtype=torch.int32),
+    )
+    cu_kv_seqlens[1] = 34
+    sequence_lengths[0] = 34
+    assert logical_kv_indptr[1] == 34
+    assert seq_lens_kv[0] == 34
+
+
+def test_context_metadata_non_1d_inputs_preserve_slice_behavior() -> None:
+    block_tables = torch.tensor(
+        [[[10, 11, 12, 13], [110, 111, 112, 113]]],
+        dtype=torch.int32,
+    )
+    cu_kv_seqlens = torch.tensor([[0, 128]], dtype=torch.int32)
+    sequence_lengths = torch.tensor([[128]], dtype=torch.int32)
+    attn = _Attention()
+    fmha = PrimsTSFmha(attn)
+    fmha._ensure_metadata_buffers(
+        torch.device("cpu"),
+        1,
+        4,
+        32,
+        need_context=True,
+    )
+
+    logical_kv_indptr, seq_lens_kv, _ = fmha._stage_context_metadata(
+        block_tables,
+        cu_kv_seqlens,
+        sequence_lengths,
+        batch_size=1,
+        page_size=32,
+        max_kv_len=128,
+        window_left=-1,
+        cache_dense_page_alias=True,
+    )
+
+    assert logical_kv_indptr is not cu_kv_seqlens
+    assert seq_lens_kv is not sequence_lengths
+    assert logical_kv_indptr.shape == (1, 2)
+    assert seq_lens_kv.shape == (1, 1)
+    assert logical_kv_indptr.data_ptr() == cu_kv_seqlens.data_ptr()
+    assert seq_lens_kv.data_ptr() == sequence_lengths.data_ptr()
+    cu_kv_seqlens[0, 1] = 127
+    sequence_lengths[0, 0] = 127
+    assert logical_kv_indptr[0, 1] == 127
+    assert seq_lens_kv[0, 0] == 127
 
 
 def _stage_b1_context_metadata(
@@ -717,7 +1622,7 @@ def _stage_b1_context_metadata(
     head_dim: int = 128,
     max_kv_len: int = 128,
     window_left: int = -1,
-) -> tuple[PrimsTSFmha, torch.Tensor]:
+) -> tuple[_Attention, PrimsTSFmha, torch.Tensor, torch.Tensor, torch.Tensor]:
     cu_kv_seqlens = torch.tensor([0, max_kv_len], dtype=torch.int32)
     sequence_lengths = torch.tensor([max_kv_len], dtype=torch.int32)
     attn = _Attention(head_dim=head_dim)
@@ -730,7 +1635,7 @@ def _stage_b1_context_metadata(
         need_context=True,
     )
 
-    _, _, dense_page_table = fmha._stage_context_metadata(
+    logical_kv_indptr, seq_lens_kv, dense_page_table = fmha._stage_context_metadata(
         block_tables,
         cu_kv_seqlens,
         sequence_lengths,
@@ -738,11 +1643,12 @@ def _stage_b1_context_metadata(
         page_size=32,
         max_kv_len=max_kv_len,
         window_left=window_left,
+        cache_dense_page_alias=True,
     )
-    return fmha, dense_page_table
+    return attn, fmha, logical_kv_indptr, seq_lens_kv, dense_page_table
 
 
-def test_context_metadata_b1_d128_full_tile_aliases_native_k_row() -> None:
+def test_context_metadata_b1_d128_full_tile_reuses_cached_alias() -> None:
     block_tables = torch.tensor(
         [[[10, 11, 12, 13, 14, 15, 16, 17], [110, 111, 112, 113, 114, 115, 116, 117]]],
         dtype=torch.int32,
@@ -750,16 +1656,280 @@ def test_context_metadata_b1_d128_full_tile_aliases_native_k_row() -> None:
     source_k_row = block_tables[0, 0, :4]
     assert source_k_row.data_ptr() % 16 == 0
 
-    fmha, dense_page_table = _stage_b1_context_metadata(block_tables)
+    attn, fmha, logical_kv_indptr, seq_lens_kv, dense_page_table = _stage_b1_context_metadata(
+        block_tables
+    )
 
     assert dense_page_table.shape == (1, 2, 4)
     assert dense_page_table.is_contiguous()
     assert dense_page_table.data_ptr() == source_k_row.data_ptr()
     assert dense_page_table.data_ptr() != fmha._context_page_indices_buffer.data_ptr()
     torch.testing.assert_close(dense_page_table[0, 0], source_k_row)
+    cached_alias = fmha._dense_context_page_alias
+    assert cached_alias is not None
+    assert cached_alias.source is block_tables
+    assert cached_alias.dense_page_idx_kv is dense_page_table
+    assert cached_alias.source_key == (
+        block_tables.device,
+        block_tables.dtype,
+        block_tables.data_ptr(),
+        tuple(block_tables.shape),
+        tuple(block_tables.stride()),
+        block_tables.storage_offset(),
+        block_tables.untyped_storage().nbytes() // block_tables.element_size(),
+        32,
+        4,
+        1,
+        128,
+        -1,
+        4,
+        128,
+    )
+
+    next_logical_kv_indptr, next_seq_lens_kv, next_dense_page_table = fmha._stage_context_metadata(
+        block_tables,
+        logical_kv_indptr,
+        seq_lens_kv,
+        batch_size=1,
+        page_size=32,
+        max_kv_len=128,
+        window_left=-1,
+        cache_dense_page_alias=True,
+    )
+
+    assert next_dense_page_table is dense_page_table
+    assert fmha.attn is attn
+    assert next_logical_kv_indptr is logical_kv_indptr
+    assert next_seq_lens_kv is seq_lens_kv
     source_k_row.add_(10)
     torch.testing.assert_close(
+        next_dense_page_table[0, 0],
+        torch.tensor([20, 21, 22, 23], dtype=torch.int32),
+    )
+
+
+def test_context_metadata_b1_cached_alias_misses_source_replacement() -> None:
+    block_tables = torch.tensor(
+        [[[10, 11, 12, 13], [110, 111, 112, 113]]],
+        dtype=torch.int32,
+    )
+    attn, fmha, logical_kv_indptr, seq_lens_kv, first_alias = _stage_b1_context_metadata(
+        block_tables
+    )
+    first_key = fmha._dense_context_page_alias.source_key
+    replacement = block_tables.clone()
+
+    _, _, replacement_alias = fmha._stage_context_metadata(
+        replacement,
+        logical_kv_indptr,
+        seq_lens_kv,
+        batch_size=1,
+        page_size=32,
+        max_kv_len=128,
+        window_left=-1,
+        cache_dense_page_alias=True,
+    )
+
+    assert replacement_alias is not first_alias
+    assert fmha.attn is attn
+    assert fmha._dense_context_page_alias.source is replacement
+    assert fmha._dense_context_page_alias.source_key != first_key
+
+
+def test_context_metadata_b1_cached_alias_reuses_fresh_native_views() -> None:
+    base_block_tables = torch.tensor(
+        [[[[10, 11, 12, 13], [110, 111, 112, 113]]]],
+        dtype=torch.int32,
+    )
+    first_wrapper = base_block_tables.select(0, 0).narrow(0, 0, 1)
+    attn, fmha, logical_kv_indptr, seq_lens_kv, first_alias = _stage_b1_context_metadata(
+        first_wrapper
+    )
+    next_wrapper = base_block_tables.select(0, 0).narrow(0, 0, 1)
+    assert next_wrapper is not first_wrapper
+
+    _, _, next_alias = fmha._stage_context_metadata(
+        next_wrapper,
+        logical_kv_indptr,
+        seq_lens_kv,
+        batch_size=1,
+        page_size=32,
+        max_kv_len=128,
+        window_left=-1,
+        cache_dense_page_alias=True,
+    )
+
+    assert fmha.attn is attn
+    assert next_alias is first_alias
+    assert fmha._dense_context_page_alias.source is first_wrapper
+    base_block_tables[0, 0, 0, :4].add_(10)
+    torch.testing.assert_close(
+        next_alias[0, 0],
+        torch.tensor([20, 21, 22, 23], dtype=torch.int32),
+    )
+
+
+def test_context_metadata_b1_cached_alias_misses_layout_change() -> None:
+    block_tables = torch.tensor(
+        [[[10, 11, 12, 13], [110, 111, 112, 113]]],
+        dtype=torch.int32,
+    )
+    attn, fmha, logical_kv_indptr, seq_lens_kv, first_alias = _stage_b1_context_metadata(
+        block_tables
+    )
+    first_key = fmha._dense_context_page_alias.source_key
+    block_tables.as_strided_((1, 2, 4), (16, 4, 1))
+    assert block_tables.is_contiguous()
+
+    _, _, restrided_alias = fmha._stage_context_metadata(
+        block_tables,
+        logical_kv_indptr,
+        seq_lens_kv,
+        batch_size=1,
+        page_size=32,
+        max_kv_len=128,
+        window_left=-1,
+        cache_dense_page_alias=True,
+    )
+
+    assert restrided_alias is not first_alias
+    assert fmha.attn is attn
+    assert fmha._dense_context_page_alias.source is block_tables
+    assert fmha._dense_context_page_alias.source_key != first_key
+
+
+def test_context_metadata_b1_cached_alias_misses_storage_geometry_change() -> None:
+    block_tables = torch.tensor(
+        [[[10, 11, 12, 13], [110, 111, 112, 113]]],
+        dtype=torch.int32,
+    )
+    attn, fmha, logical_kv_indptr, seq_lens_kv, first_alias = _stage_b1_context_metadata(
+        block_tables
+    )
+    first_key = fmha._dense_context_page_alias.source_key
+    replacement_storage = torch.arange(16, dtype=torch.int32)
+    block_tables.set_(replacement_storage.untyped_storage(), 4, (1, 2, 4), (8, 4, 1))
+    assert block_tables.data_ptr() % 16 == 0
+
+    _, _, rebound_alias = fmha._stage_context_metadata(
+        block_tables,
+        logical_kv_indptr,
+        seq_lens_kv,
+        batch_size=1,
+        page_size=32,
+        max_kv_len=128,
+        window_left=-1,
+        cache_dense_page_alias=True,
+    )
+
+    assert rebound_alias is not first_alias
+    assert fmha.attn is attn
+    assert fmha._dense_context_page_alias.source is block_tables
+    assert fmha._dense_context_page_alias.source_key != first_key
+    torch.testing.assert_close(
+        rebound_alias[0, 0],
+        torch.tensor([4, 5, 6, 7], dtype=torch.int32),
+    )
+
+
+def test_context_metadata_b1_cached_alias_retains_source() -> None:
+    block_tables = torch.tensor(
+        [[[10, 11, 12, 13], [110, 111, 112, 113]]],
+        dtype=torch.int32,
+    )
+    source_ref = weakref.ref(block_tables)
+    _, fmha, _, _, dense_page_table = _stage_b1_context_metadata(block_tables)
+
+    del block_tables
+    gc.collect()
+
+    assert source_ref() is fmha._dense_context_page_alias.source
+    torch.testing.assert_close(
         dense_page_table[0, 0],
+        torch.tensor([10, 11, 12, 13], dtype=torch.int32),
+    )
+
+    del fmha, dense_page_table
+    gc.collect()
+    assert source_ref() is None
+
+
+def test_context_metadata_b1_estimation_alias_is_not_retained() -> None:
+    normal_block_tables = torch.tensor(
+        [[[10, 11, 12, 13], [110, 111, 112, 113]]],
+        dtype=torch.int32,
+    )
+    attn, fmha, logical_kv_indptr, seq_lens_kv, normal_alias = _stage_b1_context_metadata(
+        normal_block_tables
+    )
+    assert fmha._dense_context_page_alias is not None
+    estimation_block_tables = torch.tensor(
+        [[[20, 21, 22, 23], [120, 121, 122, 123]]],
+        dtype=torch.int32,
+    )
+    estimation_ref = weakref.ref(estimation_block_tables)
+
+    _, _, estimation_alias = fmha._stage_context_metadata(
+        estimation_block_tables,
+        logical_kv_indptr,
+        seq_lens_kv,
+        batch_size=1,
+        page_size=32,
+        max_kv_len=128,
+        window_left=-1,
+        cache_dense_page_alias=False,
+    )
+
+    assert fmha.attn is attn
+    assert fmha._dense_context_page_alias is None
+    assert estimation_alias is not normal_alias
+    del estimation_alias, estimation_block_tables
+    gc.collect()
+    assert estimation_ref() is None
+
+
+def test_context_metadata_b1_cached_alias_survives_tail_fallback() -> None:
+    block_tables = torch.tensor(
+        [[[10, 11, 12, 13], [110, 111, 112, 113]]],
+        dtype=torch.int32,
+    )
+    attn, fmha, logical_kv_indptr, seq_lens_kv, cached_alias = _stage_b1_context_metadata(
+        block_tables
+    )
+    block_tables[0, 0].add_(10)
+
+    _, _, tail_alias = fmha._stage_context_metadata(
+        block_tables,
+        logical_kv_indptr,
+        seq_lens_kv,
+        batch_size=1,
+        page_size=32,
+        max_kv_len=96,
+        window_left=-1,
+        cache_dense_page_alias=True,
+    )
+
+    assert tail_alias is not cached_alias
+    torch.testing.assert_close(
+        tail_alias,
+        torch.tensor([[[20, 21, 22, 22], [20, 21, 22, 22]]], dtype=torch.int32),
+    )
+
+    _, _, reused_alias = fmha._stage_context_metadata(
+        block_tables,
+        logical_kv_indptr,
+        seq_lens_kv,
+        batch_size=1,
+        page_size=32,
+        max_kv_len=128,
+        window_left=-1,
+        cache_dense_page_alias=True,
+    )
+
+    assert fmha.attn is attn
+    assert reused_alias is cached_alias
+    torch.testing.assert_close(
+        reused_alias[0, 0],
         torch.tensor([20, 21, 22, 23], dtype=torch.int32),
     )
 
@@ -770,8 +1940,9 @@ def test_context_metadata_b1_tail_falls_back_to_staged_copy() -> None:
         dtype=torch.int32,
     )
 
-    _, dense_page_table = _stage_b1_context_metadata(block_tables, max_kv_len=96)
+    _, fmha, _, _, dense_page_table = _stage_b1_context_metadata(block_tables, max_kv_len=96)
 
+    assert fmha._dense_context_page_alias is None
     assert dense_page_table.data_ptr() != block_tables[0, 0].data_ptr()
     expected = torch.tensor([[[10, 11, 12, 12], [10, 11, 12, 12]]], dtype=torch.int32)
     torch.testing.assert_close(dense_page_table, expected)
@@ -783,8 +1954,9 @@ def test_context_metadata_b1_d256_falls_back_to_staged_copy() -> None:
         dtype=torch.int32,
     )
 
-    _, dense_page_table = _stage_b1_context_metadata(block_tables, head_dim=256)
+    _, fmha, _, _, dense_page_table = _stage_b1_context_metadata(block_tables, head_dim=256)
 
+    assert fmha._dense_context_page_alias is None
     assert dense_page_table.data_ptr() != block_tables[0, 0].data_ptr()
     expected = torch.tensor([[[10, 11, 12, 13], [10, 11, 12, 13]]], dtype=torch.int32)
     torch.testing.assert_close(dense_page_table, expected)
@@ -796,8 +1968,9 @@ def test_context_metadata_b1_window_falls_back_to_staged_copy() -> None:
         dtype=torch.int32,
     )
 
-    _, dense_page_table = _stage_b1_context_metadata(block_tables, window_left=64)
+    _, fmha, _, _, dense_page_table = _stage_b1_context_metadata(block_tables, window_left=64)
 
+    assert fmha._dense_context_page_alias is None
     assert dense_page_table.data_ptr() != block_tables[0, 0].data_ptr()
     expected = torch.tensor([[[10, 11, 12, 13], [10, 11, 12, 13]]], dtype=torch.int32)
     torch.testing.assert_close(dense_page_table, expected)
@@ -811,8 +1984,9 @@ def test_context_metadata_b1_noncompact_source_falls_back_to_staged_copy() -> No
     block_tables = storage.as_strided((1, 2, 4), (15, 8, 2))
     assert not block_tables[0, 0].is_contiguous()
 
-    _, dense_page_table = _stage_b1_context_metadata(block_tables)
+    _, fmha, _, _, dense_page_table = _stage_b1_context_metadata(block_tables)
 
+    assert fmha._dense_context_page_alias is None
     assert dense_page_table.data_ptr() != block_tables[0, 0].data_ptr()
     expected = torch.tensor([[[10, 11, 12, 13], [10, 11, 12, 13]]], dtype=torch.int32)
     torch.testing.assert_close(dense_page_table, expected)
@@ -823,8 +1997,9 @@ def test_context_metadata_b1_short_source_storage_falls_back_to_staged_copy() ->
     block_tables = storage.as_strided((1, 2, 4), (0, 0, 1))
     assert block_tables[0, 0].is_contiguous()
 
-    _, dense_page_table = _stage_b1_context_metadata(block_tables)
+    _, fmha, _, _, dense_page_table = _stage_b1_context_metadata(block_tables)
 
+    assert fmha._dense_context_page_alias is None
     assert dense_page_table.data_ptr() != block_tables[0, 0].data_ptr()
     expected = torch.tensor([[[10, 11, 12, 13], [10, 11, 12, 13]]], dtype=torch.int32)
     torch.testing.assert_close(dense_page_table, expected)
@@ -1285,8 +2460,10 @@ def test_generation_wrapper_plans_once_and_reads_live_native_csr(
         kv_cache_block_offsets=torch.empty((2, 2, 4), dtype=torch.int32),
         host_kv_cache_pool_pointers=torch.tensor([1234], dtype=torch.int64),
         host_kv_cache_pool_mapping=torch.tensor([[0, 0]], dtype=torch.int32),
-        kv_cache_manager=SimpleNamespace(
+        kv_cache_manager=_WeakManager(
             impl=SimpleNamespace(get_page_index_upper_bound=get_page_index_upper_bound),
+            num_pools=1,
+            enable_swa_scratch_reuse=False,
             kv_offset=torch.tensor([6], dtype=torch.int32),
         ),
     )
