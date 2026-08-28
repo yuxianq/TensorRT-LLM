@@ -236,7 +236,10 @@ def test_prims_ts_oversized_decode_workspace_replays_a_b_a(
         control_end = wrapper._workspace_layout.total_bytes
         control_span = decode_workspace[control_offset:control_end]
         if replay_index > 0:
-            assert torch.count_nonzero(control_span) == 0
+            if wrapper._requires_control_reset:
+                assert torch.count_nonzero(control_span) == 0
+            else:
+                assert torch.all(control_span == 0xFF)
         control_span.fill_(0xFF)
 
         if replay_index in (1, 2):
@@ -312,7 +315,11 @@ def test_prims_ts_oversized_decode_workspace_replays_a_b_a(
     captured_wrapper = captured_adapter._decode_wrappers[case.num_seqs]
     control_offset = captured_wrapper._workspace_layout.split_kv_counter.byte_offset
     control_end = captured_wrapper._workspace_layout.total_bytes
-    assert torch.count_nonzero(captured_workspace[control_offset:control_end]) == 0
+    captured_control = captured_workspace[control_offset:control_end]
+    if captured_wrapper._requires_control_reset:
+        assert torch.count_nonzero(captured_control) == 0
+    else:
+        assert torch.all(captured_control == 0xFF)
 
 
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
