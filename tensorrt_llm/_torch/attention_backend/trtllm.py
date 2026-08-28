@@ -171,6 +171,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                             init=False,
                                             repr=False)
 
+    # Positive request-scoped certificate for homogeneous dense PrimTS
+    # context layers. It is cleared by prepare() before every forward step.
+    _prims_ts_b1_context_support_key: Optional[Tuple[object, ...]] = field(
+        default=None, init=False, repr=False, compare=False)
+
     use_paged_context_fmha: bool = field(init=False, default=False, repr=False)
 
     # `DSAtrtllmAttentionMetadata` overrides this; the dense path keeps 0.
@@ -518,6 +523,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.host_request_types_runtime = host_request_types
 
     def prepare(self) -> None:
+        self._prims_ts_b1_context_support_key = None
         super().prepare()
         extra_attrs = get_model_extra_attrs()
         # If model extra attrs is set, attention_metadata is setup in executor.
@@ -644,6 +650,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def prepare_encoder_only(self) -> None:
         """Fast path for encoder-only forward (eager + CUDA graph capture)."""
+        self._prims_ts_b1_context_support_key = None
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is None:
             get_global_attrs().attention_metadata = weakref.ref(self)
