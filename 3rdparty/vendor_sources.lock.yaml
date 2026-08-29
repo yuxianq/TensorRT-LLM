@@ -9,5 +9,5 @@ vendors:
     include:
     - '**/*.py'
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
-    patch_digest: sha256:9db4dc953c79b1ce3ab86ff33eec142456831b57d50659c2e8d04f5dac632935
-    digest: sha256-tree-v1:f637e0c2d4cc0466f0ab229b97ed21ce24221ac6e9fe125600144a0ed6a84da0
+    patch_digest: sha256:d3c73e51f6ffdaa2506dfa3edc644ac0277e515d7c14a7bc2ed10339f4007eee
+    digest: sha256-tree-v1:0719b53f814641e0ac4242b7c3fa73de45c20a2cb6614dd0d681d92ae825e53d
