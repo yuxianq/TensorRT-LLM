@@ -192,15 +192,6 @@ index 5afedf76b88d1278209dc235bfa78e92b163c064..26d34029682a349e7f5af498e13e9149
  def batch_decode_with_paged_kv_cache(
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
-diff --git a/kernels/fmha_decode/fmha_decode_tasks.py b/kernels/fmha_decode/fmha_decode_tasks.py
-index 4b317728a55e48b4a291b7ecee64d89ff7221810..266eb4a43f701fdfdae08873c70a0d9fca019678 100644
---- a/kernels/fmha_decode/fmha_decode_tasks.py
-+++ b/kernels/fmha_decode/fmha_decode_tasks.py
-@@ -1,3 +1,4 @@
-+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
- # Copyright (c) 2026 by FlashInfer team.
- #
- # Licensed under the Apache License, Version 2.0 (the "License");
 diff --git a/mla_decode.py b/mla_decode.py
 index 188f293d9d2662ac7cee4a3323608b3038bab2f6..34c05751085c11c78b386044a53e4e3a455aa7ac 100644
 --- a/mla_decode.py
