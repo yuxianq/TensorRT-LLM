@@ -298,7 +298,6 @@ def test_prims_ts_uses_compact_preprocessing_and_separate_decode_workspace(
     control_end = captured_wrapper._workspace_layout.total_bytes
     assert torch.count_nonzero(captured_workspace[control_offset:control_end]) == 0
 
-
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
 def test_prims_ts_deepseek_v3_lite_mla_generation(
     monkeypatch: pytest.MonkeyPatch,
