@@ -37,15 +37,10 @@ index b3c6d3fe0c3d462fd69f396f2e6867c6d8fd43ba..17a2d9e12bca1c5e118808cce62e75f8
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/context.py b/context.py
-index fdded4cbe7bf232c7a0abddb9bd4b737dd50fa25..221a5a750c5fc225e403323c0875e9173e6dd9a8 100644
+index 3a045ff766a073d7af50ac8ea97f270f2a26e150..40e698d87f299f69a38185f3b5065cd37a71a0b9 100644
 --- a/context.py
 +++ b/context.py
-@@ -1,3 +1,4 @@
-+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
- # Copyright (c) 2026 by FlashInfer team.
- #
- # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -2417,6 +2418,45 @@ class BatchPrefillPagedTSWrapper:
+@@ -2387,6 +2387,45 @@ class BatchPrefillPagedTSWrapper:
          self._live_metadata = True
          self._planned = True
  
