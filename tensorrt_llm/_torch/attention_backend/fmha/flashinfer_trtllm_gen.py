@@ -678,6 +678,12 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> Tuple[bool, str]:
+        sparse_runtime_params = fwd.sparse_runtime_params
+        if (
+            sparse_runtime_params is not None
+            and sparse_runtime_params.block_sparse_inputs is not None
+        ):
+            return False, "block_sparse_inputs are not supported."
         is_mla_enable = attn.is_mla_enable
         if phase is None:
             has_context_phase = fwd.attention_input_type != AttentionInputType.generation_only
@@ -759,8 +765,12 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False, "sage attention."
         if meta.helix_position_offsets is not None:
             return False, "helix parallelism."
-        sparse_kv_indices = fwd.sparse_runtime_params.sparse_kv_indices
-        sparse_attn_indices = fwd.sparse_runtime_params.sparse_attn_indices
+        sparse_kv_indices = (
+            sparse_runtime_params.sparse_kv_indices if sparse_runtime_params is not None else None
+        )
+        sparse_attn_indices = (
+            sparse_runtime_params.sparse_attn_indices if sparse_runtime_params is not None else None
+        )
         if (
             (sparse_kv_indices is not None and sparse_kv_indices.numel() > 0)
             or (sparse_attn_indices is not None and sparse_attn_indices.numel() > 0)
