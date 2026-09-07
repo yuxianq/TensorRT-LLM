@@ -13,6 +13,7 @@ import torch
 import yaml
 from pydantic import ValidationError
 
+from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
     SkipSoftmaxParams,
     SkipSoftmaxScheduler,
@@ -21,6 +22,9 @@ from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import fmha as cu
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.fmha import (
     CuTeDSLAttention,
     _resolve_skip_softmax_threshold_scale_factor,
+)
+from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import (
+    TrtllmAttention as VisualGenTrtllmAttention,
 )
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
@@ -631,3 +635,61 @@ class TestVisualGenSkipSoftmaxPipelineConfig:
             _expected_threshold(-20.0, 4.0, 0.5)
         )
         assert transformer_disabled_params is None
+
+
+class TestVisualGenSkipSoftmaxTrtllmBackend:
+    """The VisualGen TRTLLM backend schedules SkipSoftmax thresholds itself."""
+
+    @staticmethod
+    def _make_attention(sparse_params: Optional[SkipSoftmaxParams]) -> VisualGenTrtllmAttention:
+        attention = object.__new__(VisualGenTrtllmAttention)
+        attention.sparse_params = sparse_params
+        return attention
+
+    @staticmethod
+    def _predict(attention: VisualGenTrtllmAttention, timestep: Optional[float]):
+        forward_args = AttentionForwardArgs(
+            timestep=None if timestep is None else torch.tensor([timestep])
+        )
+        q = torch.zeros(1, 8, 64)
+        return attention.predict_sparse_attention(q, None, None, SimpleNamespace(), forward_args)
+
+    @pytest.mark.parametrize("timestep", [None, 0.8, 0.2])
+    def test_predict_sparse_attention_applies_scheduler(self, timestep: Optional[float]):
+        sparse_params = SkipSoftmaxAttentionConfig(
+            threshold_scale_factor=5000.0,
+            disabled_until_timestep=0.5,
+        ).to_sparse_params()
+        attention = self._make_attention(sparse_params)
+
+        runtime_params = self._predict(attention, timestep)
+
+        scheduled = sparse_params.scheduler.get_runtime_params(
+            timestep=None if timestep is None else torch.tensor([timestep])
+        )
+        assert runtime_params.threshold_scale_factor_prefill == pytest.approx(
+            scheduled.threshold_scale_factor_prefill
+        )
+        assert runtime_params.threshold_scale_factor_decode == pytest.approx(
+            scheduled.threshold_scale_factor_decode
+        )
+        assert runtime_params.sparse_attn_indices_block_size == 0
+
+    def test_enabled_phase_forwards_configured_threshold(self):
+        sparse_params = SkipSoftmaxAttentionConfig(threshold_scale_factor=5000.0).to_sparse_params()
+        attention = self._make_attention(sparse_params)
+
+        runtime_params = self._predict(attention, None)
+
+        assert runtime_params.threshold_scale_factor_prefill == pytest.approx(
+            _prefill_threshold(sparse_params)
+        )
+        assert runtime_params.threshold_scale_factor_prefill > 0.0
+
+    def test_dense_backend_keeps_zero_thresholds(self):
+        attention = self._make_attention(None)
+
+        runtime_params = self._predict(attention, None)
+
+        assert runtime_params.threshold_scale_factor_prefill == 0.0
+        assert runtime_params.threshold_scale_factor_decode == 0.0

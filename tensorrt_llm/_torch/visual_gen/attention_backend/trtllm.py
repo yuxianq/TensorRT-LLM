@@ -27,7 +27,12 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
-from ...attention.backends.interface import AttentionRuntimeFeatures, PredefinedAttentionMask
+from ...attention.backends.interface import (
+    AttentionForwardArgs,
+    AttentionRuntimeFeatures,
+    PredefinedAttentionMask,
+)
+from ...attention.backends.sparse.params import SparseRuntimeParams
 from ...attention.backends.sparse.skip_softmax import SkipSoftmaxParams
 from ...attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ...attention.backends.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
@@ -221,6 +226,29 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         )
 
         self.quant_attention_config = quant_attention_config
+
+    def predict_sparse_attention(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: BaseTrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> SparseRuntimeParams:
+        """Schedule SkipSoftmax thresholds on top of the base prediction.
+
+        VisualGen instantiates this backend directly with ``SkipSoftmaxParams``
+        instead of resolving it through the LLM sparse backend registry, so the
+        timestep-aware threshold scheduler is applied here.
+        """
+        runtime_params = super().predict_sparse_attention(q, k, v, metadata, forward_args)
+        sparse_params = self.sparse_params
+        if isinstance(sparse_params, SkipSoftmaxParams):
+            runtime_params = sparse_params.scheduler.get_runtime_params(
+                runtime_params=runtime_params,
+                timestep=forward_args.timestep,
+            )
+        return runtime_params
 
     # Needed to work with torch compile cause of attention metadata
     # make attn metadata as input for it to work
