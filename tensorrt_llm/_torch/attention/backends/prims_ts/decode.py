@@ -55,6 +55,7 @@ _SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
 _WORKSPACE_ALIGNMENT = 256
 _WORKSPACE_DTYPES = (torch.int8, torch.uint8)
+_MAX_HEAD_RATIO = 128
 
 
 @dataclass(frozen=True)
@@ -199,6 +200,7 @@ def _decode_policy_from_config(
         ),
         ("tile_size_q", int(config.tile_size_q)),
         ("tile_size_kv", int(config.tile_size_kv)),
+        ("num_insts_kv", int(config.num_insts_kv)),
         ("use_split_kv", bool(config.use_split_kv)),
         ("splits_kv", int(config.splits_kv)),
         ("max_splits_kv", int(config.max_splits_kv)),
@@ -604,9 +606,10 @@ def _validate_head_geometry(num_qo_heads: int, num_kv_heads: int) -> None:
             f"{num_qo_heads} and {num_kv_heads}"
         )
     head_ratio = num_qo_heads // num_kv_heads
-    if head_ratio > 32:
+    if head_ratio > _MAX_HEAD_RATIO:
         raise ValueError(
-            f"attention-ts decode requires 1 <= Hq/Hkv <= 32, got {head_ratio}"
+            "attention-ts decode requires "
+            f"1 <= Hq/Hkv <= {_MAX_HEAD_RATIO}, got {head_ratio}"
         )
 
 
@@ -1009,6 +1012,7 @@ def _csr_to_block_tables(
     seq_lens: tuple[int, ...],
     *,
     page_size: int,
+    min_table_capacity: int = 0,
 ) -> torch.Tensor:
     """Materialize canonical CSR page IDs as a native fixed page table.
 
@@ -1016,8 +1020,9 @@ def _csr_to_block_tables(
     offsets and logical lengths. Equal-width rows are exposed as a zero-copy
     view only when their actual CSR extents equal the native table capacity.
     Otherwise a temporary dense table copies each active prefix from its true
-    CSR row start. Its inactive tail is deliberately invalid; the native kernel
-    must bound every access by ``seq_lens``.
+    CSR row start. ``min_table_capacity`` may reserve additional plan-owned
+    columns. Every inactive tail entry is deliberately ``-1``; the native
+    kernel must bound every access by ``seq_lens``.
     """
 
     if paged_kv_indices.ndim != 1:
@@ -1036,7 +1041,9 @@ def _csr_to_block_tables(
         raise ValueError("CSR indptr offsets must be nondecreasing")
     if indptr[-1] != int(paged_kv_indices.numel()):
         raise ValueError("the final CSR indptr offset must equal the page-ID count")
-    table_capacity = max(page_counts)
+    if min_table_capacity < 0:
+        raise ValueError("min_table_capacity must be nonnegative")
+    table_capacity = max(max(page_counts), min_table_capacity)
     csr_page_counts = tuple(
         end - begin for begin, end in zip(indptr[:-1], indptr[1:], strict=True)
     )
